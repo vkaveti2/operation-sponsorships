@@ -42,6 +42,10 @@ class DiscoveryError(OutreachError):
     """Lead discovery failed (bad key, bad input, unreadable CSV)."""
 
 
+class DiscoveryAuthError(DiscoveryError):
+    """The Hunter or Apollo key was rejected or lacks access. Every later lookup would fail too."""
+
+
 class QuotaExceeded(DiscoveryError):
     """The lead-discovery plan has no credits left. Stop the batch, keep what was found."""
 

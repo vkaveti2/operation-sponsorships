@@ -171,3 +171,44 @@ class FakeGspreadClient:
         self.created_titles.append(title)
         self.spreadsheet = FakeSpreadsheet(title=title)
         return self.spreadsheet
+
+
+class FakeGmail:
+    """Stands in for GmailApi. Scripts are lists consumed one call at a time: None = succeed, exception = raise."""
+
+    def __init__(self, email="pennstatemcvb@gmail.com"):
+        self.email = email
+        self.sent, self.drafts, self.calls = [], {}, []
+        self.send_script, self.draft_script, self.exists_script = [], [], []
+        self.before_send = None
+
+    @staticmethod
+    def _next(script):
+        if script:
+            item = script.pop(0)
+            if item is not None:
+                raise item
+
+    def profile_email(self):
+        self.calls.append("profile")
+        return self.email
+
+    def create_draft(self, raw):
+        self.calls.append("create_draft")
+        self._next(self.draft_script)
+        draft_id = f"d{len(self.drafts) + 1}"
+        self.drafts[draft_id] = raw
+        return draft_id
+
+    def send_raw(self, raw):
+        self.calls.append("send")
+        if self.before_send:
+            self.before_send(raw)
+        self._next(self.send_script)
+        self.sent.append(raw)
+        return f"m{len(self.sent)}"
+
+    def draft_exists(self, draft_id):
+        self.calls.append("exists")
+        self._next(self.exists_script)
+        return draft_id in self.drafts

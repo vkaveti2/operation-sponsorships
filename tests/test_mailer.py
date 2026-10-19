@@ -18,52 +18,11 @@ from config.errors import MailError, SheetError
 from config.settings import COLUMNS, HARD_CAP_PER_RUN, Col, Sender, Settings
 from src import mailer as M
 from src.sheet_manager import SheetManager
-from tests.fakes import FakeSpreadsheet, FakeWorksheet
+from tests.fakes import FakeGmail, FakeSpreadsheet, FakeWorksheet
 from tests.samples import GOOD_BODY, approved
 
 NOW = datetime(2026, 10, 18, 15, 30, tzinfo=timezone.utc)
 COL = {name: i + 1 for i, name in enumerate(COLUMNS)}
-
-
-class FakeGmail:
-    """Stands in for GmailApi. Scripts are lists consumed one call at a time: None = succeed, exception = raise."""
-
-    def __init__(self, email="pennstatemcvb@gmail.com"):
-        self.email = email
-        self.sent, self.drafts, self.calls = [], {}, []
-        self.send_script, self.draft_script, self.exists_script = [], [], []
-        self.before_send = None
-
-    @staticmethod
-    def _next(script):
-        if script:
-            item = script.pop(0)
-            if item is not None:
-                raise item
-
-    def profile_email(self):
-        self.calls.append("profile")
-        return self.email
-
-    def create_draft(self, raw):
-        self.calls.append("create_draft")
-        self._next(self.draft_script)
-        draft_id = f"d{len(self.drafts) + 1}"
-        self.drafts[draft_id] = raw
-        return draft_id
-
-    def send_raw(self, raw):
-        self.calls.append("send")
-        if self.before_send:
-            self.before_send(raw)
-        self._next(self.send_script)
-        self.sent.append(raw)
-        return f"m{len(self.sent)}"
-
-    def draft_exists(self, draft_id):
-        self.calls.append("exists")
-        self._next(self.exists_script)
-        return draft_id in self.drafts
 
 
 def decode(raw):
@@ -488,8 +447,9 @@ def test_message_headers_and_body():
 
 
 def test_non_ascii_text_survives():
-    msg = decode(M.build_raw_message(Sender(), "a@b.com", "Café partnership", "Hi José,\n\nThanks."))
-    assert msg["Subject"] == "Café partnership" and "José" in msg.get_content()
+    e = chr(0xE9)
+    msg = decode(M.build_raw_message(Sender(), "a@b.com", f"Caf{e} partnership", f"Hi Jos{e},\n\nThanks."))
+    assert msg["Subject"] == f"Caf{e} partnership" and f"Jos{e}" in msg.get_content()
 
 
 @pytest.mark.parametrize("subject,to", [("bad\nBcc: evil@x.com", "a@b.com"), ("ok", "a@b.com\nBcc: evil@x.com"), ("bad\rsubject", "a@b.com")])
@@ -501,10 +461,11 @@ def test_header_injection_is_impossible(subject, to):
 # --------------------------------------------------------------------------- GmailApi: classification with a fake session
 class FakeSession:
     def __init__(self, *items):
-        self.items, self.requests = list(items), []
+        self.items, self.requests, self.headers = list(items), [], []
 
-    def request(self, method, url, json=None, timeout=None):
+    def request(self, method, url, json=None, headers=None, timeout=None):
         self.requests.append((method, url, json, timeout))
+        self.headers.append(headers)
         item = self.items.pop(0)
         if isinstance(item, BaseException):
             raise item
@@ -536,6 +497,7 @@ def test_successful_calls_hit_the_right_endpoints():
         ("POST", "https://gmail.test/v1/users/me/messages/send"), ("GET", "https://gmail.test/v1/users/me/drafts/d9")]
     assert session.requests[1][2] == {"message": {"raw": "RAW"}} and session.requests[2][2] == {"raw": "RAW"}
     assert all(t == M.REQUEST_TIMEOUT for _, _, _, t in session.requests)
+    assert all(h == {"Connection": "close"} for h in session.headers)  # a fresh socket for every call
 
 
 @pytest.mark.parametrize("status,reason,kind", [
@@ -682,3 +644,29 @@ def test_a_server_that_reads_the_request_and_never_answers_is_unknown():
         gmail.send_raw("QUJD")
     srv.close()
     assert info.value.kind == "unknown" and received and b"QUJD" in received[0]
+
+
+def test_plan_matches_run_for_a_hand_typed_row_with_a_blank_send_status():
+    row = approved("L1", **{Col.SEND: ""})
+    mailer, sheet, ws, gmail, _ = build([row])
+    ready, blocked, remaining = mailer.plan()
+    assert [r.row_id for r in ready] == ["L1"] and blocked == [] and remaining == 0
+    assert len(mailer.run(live=True).sent) == 1
+
+
+def test_note_blocked_writes_reasons_to_the_sheet_and_touches_nothing_else():
+    rows = [approved("L1"), approved("L2", "Bad", "bad@bad.com", **{Col.SUBJECT: ""})]
+    mailer, sheet, ws, gmail, _ = build(rows)
+    ready, blocked, _ = mailer.plan()
+    mailer.note_blocked(blocked)
+    assert "[send] not sent: the subject is empty" in sheet.get_row("L2").notes and sheet.get_row("L1").notes == ""
+    assert statuses(sheet) == {"L1": ("Approved", "Unsent"), "L2": ("Approved", "Unsent")}
+    assert gmail.calls == [] and gmail.sent == [] and gmail.drafts == {}  # a note is not a send, or even a Gmail call
+
+
+def test_a_note_is_not_written_over_one_a_human_just_typed():
+    mailer, sheet, ws, gmail, _ = build([approved("L1", **{Col.SUBJECT: "", Col.NOTES: "old note"})])
+    _, blocked, _ = mailer.plan()
+    ws.before_read = lambda w: w._set(2, COL[Col.NOTES], "the human wrote this a moment ago")
+    mailer.note_blocked(blocked)
+    assert sheet.get_row("L1").notes == "the human wrote this a moment ago"

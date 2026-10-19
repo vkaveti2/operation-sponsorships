@@ -40,7 +40,7 @@ from config.settings import (
 )
 from src.guardrails import lint_for_send
 from src.models import LeadRow, normalize_email
-from src.sheet_manager import SheetManager, same, select_rows, tool_note
+from src.sheet_manager import SheetManager, same, tool_note
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +98,10 @@ class GmailApi:
     def _call(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         url = self._base + path
         try:
-            response = self._session.request(method, url, json=body, timeout=self._timeout)
+            # "Connection: close" gives every call a fresh socket. A laptop that slept between two
+            # sends could otherwise hand us a dead pooled connection and turn a clean send into an
+            # ambiguous one.
+            response = self._session.request(method, url, json=body, headers={"Connection": "close"}, timeout=self._timeout)
         except (RefreshError, TransportError) as exc:  # raised while getting a token, before sending
             raise GmailCallError(
                 "run", "Google would not give a fresh login token. Run: python main.py auth. Nothing was sent."
@@ -199,6 +202,16 @@ def local_now() -> datetime:
     return datetime.now().astimezone()
 
 
+def count_sent_since(rows: Sequence[LeadRow], since: datetime) -> int:
+    """Rows whose Sent Timestamp is at or after `since`. Unreadable timestamps are ignored."""
+    count = 0
+    for row in rows:
+        stamp = parse_iso(row.get(Col.SENT_AT))
+        if stamp and stamp >= since:
+            count += 1
+    return count
+
+
 def parse_iso(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat((value or "").strip())
@@ -244,18 +257,18 @@ class Mailer:
             )
         return actual
 
+    @staticmethod
+    def _eligible(rows: Sequence[LeadRow]) -> list[LeadRow]:
+        """Approved rows that have not been handled. A blank Send Status counts as Unsent, so a
+        hand-typed row previews the same way it will be processed."""
+        return [r for r in rows if same(r.approval, Approval.APPROVED) and (not r.send_status or same(r.send_status, SendStatus.UNSENT))]
+
     def eligible_rows(self) -> list[LeadRow]:
         """Approved + Unsent rows in sheet order (read only; no tidy-up writes)."""
-        return select_rows(self.sheet.read_rows(), approval=Approval.APPROVED, send=SendStatus.UNSENT)
+        return self._eligible(self.sheet.read_rows())
 
     def sent_in_last_24h(self) -> int:
-        cutoff = self._clock() - timedelta(hours=24)
-        count = 0
-        for row in self.sheet.read_rows():
-            stamp = parse_iso(row.get(Col.SENT_AT))
-            if stamp and stamp >= cutoff:
-                count += 1
-        return count
+        return count_sent_since(self.sheet.read_rows(), self._clock() - timedelta(hours=24))
 
     @staticmethod
     def _contacted(rows: Sequence[LeadRow]) -> set[str]:
@@ -272,7 +285,7 @@ class Mailer:
         ready: list[LeadRow] = []
         blocked: list[tuple[LeadRow, list[str]]] = []
         remaining = 0
-        for row in select_rows(everything, approval=Approval.APPROVED, send=SendStatus.UNSENT):
+        for row in self._eligible(everything):
             problems = self._problems(row, contacted)
             if problems:
                 blocked.append((row, problems))
@@ -351,12 +364,22 @@ class Mailer:
         return report
 
     # ---- one row
-    def _block(self, row: LeadRow, problems: Sequence[str], report: MailReport) -> None:
+    def _note_blocked(self, row: LeadRow, problems: Sequence[str]) -> str:
+        """Write why a row was not sent into its Notes cell, never over a note a human just edited."""
         text = "; ".join(problems)
-        report.outcomes.append(MailOutcome(row.row_id, row.label(), "blocked", text))
         update = self._note(row, f"not sent: {text}. Fix the row and it goes out on the next run.")
         if update:
-            self._write(row.row_id, update)
+            self._write(row.row_id, update, expect={Col.NOTES: row.notes})
+        return text
+
+    def note_blocked(self, blocked: Sequence[tuple[LeadRow, Sequence[str]]]) -> None:
+        """Record in Notes why each blocked row was not sent. Writes notes only: sends and drafts nothing."""
+        for row, problems in blocked:
+            self._note_blocked(row, problems)
+
+    def _block(self, row: LeadRow, problems: Sequence[str], report: MailReport) -> None:
+        text = self._note_blocked(row, problems)
+        report.outcomes.append(MailOutcome(row.row_id, row.label(), "blocked", text))
 
     def _process(self, listed: LeadRow, live: bool, contacted: set[str]) -> tuple[MailOutcome, bool]:
         """Returns (outcome, stop_the_run)."""
@@ -369,11 +392,7 @@ class Mailer:
             return MailOutcome(row_id, label, "skipped", f"changed to {row.approval or 'blank'} / {row.send_status or 'blank'} since the run started"), False
         problems = self._problems(row, contacted)
         if problems:
-            text = "; ".join(problems)
-            update = self._note(row, f"not sent: {text}. Fix the row and it goes out on the next run.")
-            if update:
-                self._write(row_id, update)
-            return MailOutcome(row_id, label, "blocked", text), False
+            return MailOutcome(row_id, label, "blocked", self._note_blocked(row, problems)), False
         try:
             raw = build_raw_message(self.settings.sender, normalize_email(row.email), row.subject, row.body)
         except ValueError as exc:
