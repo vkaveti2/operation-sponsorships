@@ -1,0 +1,28 @@
+# --- secrets and local state (this repo is PUBLIC) ---
+.env
+.env.*
+!.env.template
+config/credentials.json
+config/token.json
+credentials.json
+token.json
+client_secret*.json
+*.pem
+logs/
+
+# --- lead data stays out of git; only the example list is tracked ---
+data/*
+!data/targets.example.csv
+
+# --- python ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- os / editor ---
+.DS_Store
+.idea/
+.vscode/

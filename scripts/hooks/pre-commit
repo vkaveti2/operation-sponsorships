@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Pre-commit guard for a PUBLIC repo: refuse to commit secrets or lead data.
+# Enable once per clone:   git config core.hooksPath scripts/hooks
+# Bypass only if you are certain:   git commit --no-verify
+set -u
+
+fail=0
+note() { printf 'pre-commit: %s\n' "$*" >&2; }
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+[ -z "$staged" ] && exit 0
+
+# 1) Paths that must never be committed.
+while IFS= read -r f; do
+  case "$f" in
+    .env.template) ;;
+    .env|.env.*|*/.env|*/.env.*)
+      note "BLOCKED $f (secrets file)"; fail=1 ;;
+    *credentials.json|*token.json|*client_secret*.json|*.pem|*.p12|*.key)
+      note "BLOCKED $f (Google or OAuth secrets)"; fail=1 ;;
+    logs/*)
+      note "BLOCKED $f (logs can contain lead emails)"; fail=1 ;;
+    data/targets.example.csv) ;;
+    data/*)
+      note "BLOCKED $f (lead data does not belong in a public repo)"; fail=1 ;;
+  esac
+done <<< "$staged"
+
+# 2) Key-shaped strings in the lines being added.
+secret_regex='sk-ant-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{30,}|GOCSPX-[A-Za-z0-9_-]{16,}|ya29\.[A-Za-z0-9_-]{20,}|1//[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}'
+assign_regex='(API_KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9_./+=-]{20,}'
+
+added="$(git diff --cached -U0 --no-color --diff-filter=ACMR | grep -E '^\+' | grep -Ev '^\+\+\+ ' || true)"
+hits="$(printf '%s\n' "$added" | grep -Ec -e "$secret_regex" -e "$assign_regex" || true)"
+if [ "${hits:-0}" -gt 0 ]; then
+  note "BLOCKED: $hits added line(s) look like an API key, token, or private key."
+  note "Inspect with: git diff --cached"
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  note "commit aborted. Fix the above (or bypass at your own risk with --no-verify)."
+  exit 1
+fi
+exit 0
