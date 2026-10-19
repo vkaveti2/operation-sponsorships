@@ -23,11 +23,11 @@ discover leads -> LLM drafts -> you review in the Sheet -> Gmail drafts (default
 | Google OAuth loader (`config/credentials.py`) | done, tested (one login covers Sheets, Drive and Gmail) |
 | Sheet manager (`src/sheet_manager.py`) | done, tested (dropdowns, colors, Row ID lookup, edit-conflict guard, retries) |
 | LLM layer (`src/llm.py`, Claude or Gemini), guardrails, drafter (`src/drafter.py`) | done, tested |
-| Mailer: drafts and rate-limited send (`src/mailer.py`) | next |
-| Lead discovery: Hunter / Apollo / CSV (`src/discovery.py`) | planned |
+| Mailer: Gmail drafts (default) and rate-limited live send (`src/mailer.py`) | done, tested |
+| Lead discovery: Hunter / Apollo / CSV (`src/discovery.py`) | next |
 | CLI (`main.py`) and tests | planned |
 
-This table is updated with every commit. 211 automated tests run offline with `.venv/bin/python -m pytest`.
+This table is updated with every commit. 287 automated tests run offline with `.venv/bin/python -m pytest`.
 
 ## Setup (what works today)
 
@@ -116,6 +116,34 @@ Season wording follows the calendar. August to September says we are in the midd
 December says we are wrapping it up and gearing up for spring, January to April says we are in the spring run with
 regionals and nationals ahead, and May to July says we are planning for next season.
 
+## How sending works
+
+`python main.py send` (CLI coming) looks only at rows that are `Approved` + `Unsent`.
+
+| Mode | Command | What happens |
+|---|---|---|
+| Drafts (default) | `send` | Creates a Gmail draft per row. Nothing is sent. You open Gmail Drafts, read, and press Send. Row becomes `Drafted`. |
+| Live | `send --live` | Sends for real. Row becomes `Sent` with an ISO timestamp and the Gmail ID. |
+
+Limits, enforced in code (`config/settings.py`):
+- at most **15 emails per run**, in both modes (`MAX_EMAILS_PER_RUN` can lower it, never raise it)
+- a random **180 to 420 second** pause between live sends, never before the first one
+- the signed-in Google account must be pennstatemcvb@gmail.com or nothing runs
+
+Protections against the worst failure, emailing a brand twice:
+- The row is marked `Sending` *before* Gmail is called, and re-checked at that moment, so a row you flipped to
+  `Rejected` a second ago is not sent. Text edited at the last instant is not sent either.
+- The send call is never repeated. If Gmail does not confirm (timeout, dropped connection, server error) the row stays
+  in `Sending`, the run stops, and `Notes` tells you to check the Gmail Sent folder. Rows in `Sending` are never retried
+  automatically; you set them to `Sent` or `Unsent` yourself.
+- The same address is never mailed twice, across rows or within a run.
+- Before sending, each row is checked again: valid address, subject and body present, no leftover `[placeholders]`, no
+  banned brand. A row that fails is skipped with the reason in `Notes`, and it goes out on a later run once fixed.
+- Three failures in a row stop the run. A quota or login problem puts the row back to `Unsent` and stops.
+- Ctrl+C is safe at any point.
+
+If you send a draft by hand, `python main.py sync` (coming) marks rows `Sent` once their draft has left Gmail Drafts.
+
 ## Pitch rules the drafter must follow
 
 - Never name brands we already work with. The line is exactly: *"We have partnered with brands in the past and are
@@ -130,7 +158,7 @@ regionals and nationals ahead, and May to July says we are planning for next sea
 
 ```
 config/    settings, error types, logging, Google OAuth loader, Google error messages
-src/       models, sheet_manager, llm, guardrails, drafter (done); mailer, discovery (coming)
+src/       models, sheet_manager, llm, guardrails, drafter, mailer (done); discovery (coming)
 scripts/   hooks/pre-commit
 data/      targets.example.csv (your real lead CSVs stay local and gitignored)
 tests/     pytest, no network
