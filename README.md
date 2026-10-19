@@ -20,14 +20,14 @@ discover leads -> LLM drafts -> you review in the Sheet -> Gmail drafts (default
 | Config, settings, logging, errors (`config/`) | done |
 | Virtualenv + pinned dependencies | done |
 | Secret-blocking pre-commit hook | done, tested |
-| Google OAuth loader (`config/credentials.py`) | next |
-| Sheet manager (`src/sheet_manager.py`) | planned |
-| LLM drafter + guardrails (`src/drafter.py`) | planned |
+| Google OAuth loader (`config/credentials.py`) | done, tested (one login covers Sheets, Drive and Gmail) |
+| Sheet manager (`src/sheet_manager.py`) | done, tested (dropdowns, colors, Row ID lookup, edit-conflict guard, retries) |
+| LLM drafter + guardrails (`src/drafter.py`) | next |
 | Mailer: drafts and rate-limited send (`src/mailer.py`) | planned |
 | Lead discovery: Hunter / Apollo / CSV (`src/discovery.py`) | planned |
 | CLI (`main.py`) and tests | planned |
 
-This table is updated with every commit.
+This table is updated with every commit. 76 automated tests run offline with `.venv/bin/python -m pytest`.
 
 ## Setup (what works today)
 
@@ -55,6 +55,36 @@ Copy `.env.template` to `.env` and fill it in as features land. `.env` is gitign
 - **Public-repo guard.** `scripts/hooks/pre-commit` blocks `.env`, OAuth files, logs, lead CSVs, and anything that
   looks like an API key or token.
 
+## The review sheet
+
+One Google Sheet is the queue. You edit drafts right in the cell, flip `Approval Status`, and the tools do the rest.
+
+| Column | Who fills it |
+|---|---|
+| Row ID | tool (stable key; safe to sort and filter the sheet) |
+| Company Name, Category, Target Name, Target Email, Custom Hook / Angle | import or you |
+| Generated Subject, Generated Body | drafter, then you edit freely |
+| Approval Status | drafter sets `Pending Approval`; **you** set `Approved` or `Rejected` |
+| Send Status | mailer: `Unsent` -> `Sending` -> `Drafted` / `Sent` / `Failed` |
+| Sent Timestamp, Gmail ID, Notes, Company Domain | tool |
+
+`Approval Status` is `Pending` (needs a draft), `Pending Approval` (draft ready for you), `Approved`, or `Rejected`.
+
+How the sheet protects you:
+- Columns are found by header name, so you can reorder them.
+- Every write re-finds the row by Row ID first, so sorting mid-run cannot hit the wrong lead.
+- If you change a row while a run is in flight, the tool detects it and skips that row.
+- Only the cells a step owns are written; your edits elsewhere are never overwritten.
+- Everything is written as plain text, so no generated text can become a spreadsheet formula.
+
+## Google sign-in
+
+One browser login (`python main.py auth`, coming with the CLI) covers Sheets, Drive and Gmail.
+The login is saved to `config/token.json` (gitignored, owner-only permissions) and refreshed automatically.
+It refuses to save unless you signed in as pennstatemcvb@gmail.com and granted every permission.
+If the Google Cloud consent screen is left in "Testing", Google expires the login every 7 days; the README setup section
+will cover publishing the app to avoid that.
+
 ## Pitch rules the drafter must follow
 
 - Never name brands we already work with. The line is exactly: *"We have partnered with brands in the past and are
@@ -68,8 +98,8 @@ Copy `.env.template` to `.env` and fill it in as features land. `.env` is gitign
 ## Layout
 
 ```
-config/    settings, error types, logging (credentials loader coming)
-src/       discovery, sheet_manager, drafter, mailer (coming)
+config/    settings, error types, logging, Google OAuth loader, Google error messages
+src/       models, sheet_manager (done); drafter, mailer, discovery (coming)
 scripts/   hooks/pre-commit
 data/      targets.example.csv (your real lead CSVs stay local and gitignored)
 tests/     pytest, no network

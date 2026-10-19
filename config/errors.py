@@ -48,3 +48,7 @@ class QuotaExceeded(DiscoveryError):
 
 class MailError(OutreachError):
     """Gmail failure that should stop the run (wrong account, quota, auth)."""
+
+
+class RowChanged(SheetError):
+    """A row was edited by a human after we read it, so the write was skipped."""
