@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
@@ -41,6 +44,7 @@ PER_DOMAIN_DEFAULT = 2
 MIN_CONFIDENCE_DEFAULT = 50
 MIN_TITLE_SCORE = 10
 LOOKUP_LIMIT_DEFAULT = 20
+RECHECK_DAYS_DEFAULT = 30  # a brand searched with no usable contact is left alone for this long
 HUNTER_RETRY_DELAYS = (2, 6, 15)
 
 
@@ -336,6 +340,24 @@ class Backend(Protocol):
     def find_contacts(self, target: Target, *, per_domain: int, broad: bool, min_confidence: int) -> LookupResult: ...
 
 
+@dataclass(frozen=True)
+class Balance:
+    """What is left on a lookup plan for this billing period."""
+
+    plan: str
+    remaining: float
+    available: float
+    reset_date: str = ""
+
+
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
 def _error_text(response: Any) -> str:
     try:
         data = response.json()
@@ -357,6 +379,7 @@ class HunterBackend:
 
     name = "Hunter"
     URL = "https://api.hunter.io/v2/domain-search"
+    ACCOUNT_URL = "https://api.hunter.io/v2/account"  # free to call
     DEPARTMENTS = "marketing,communication"
     LIMIT = 10  # the free plan caps limit+offset at 10, and 10 is enough once titles are filtered
 
@@ -365,13 +388,13 @@ class HunterBackend:
         self._session = session or requests.Session()
         self._sleep = sleep
 
-    def _get(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _get(self, params: dict[str, Any], url: str | None = None) -> dict[str, Any]:
         headers = {"X-API-KEY": self._key, "Accept": "application/json"}  # in a header, never in the URL
         attempts = len(HUNTER_RETRY_DELAYS) + 1
         for attempt in range(attempts):
             last = attempt == attempts - 1
             try:
-                response = self._session.get(self.URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+                response = self._session.get(url or self.URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
             except requests.exceptions.RequestException as exc:
                 if not last:
                     self._sleep(HUNTER_RETRY_DELAYS[attempt])
@@ -418,6 +441,27 @@ class HunterBackend:
                 confidence=confidence, status=status, source=HunterBackend.name,
             ))
         return out
+
+    def balance(self) -> Balance | None:
+        """Credits left this billing period (Hunter's account endpoint is free to call).
+
+        Returns None when the reply is not in the documented shape, so callers can simply skip the display.
+        A rejected key raises DiscoveryAuthError like any other call.
+        """
+        data = self._get({}, url=self.ACCOUNT_URL).get("data")
+        requested = data.get("requests") if isinstance(data, dict) else None
+        if not isinstance(requested, dict):
+            return None
+        # With a single credits pool that number is the one to plan with. Otherwise domain searches draw on "searches".
+        for name in ("credits", "searches"):
+            block = requested.get(name)
+            if not isinstance(block, dict):
+                continue
+            remaining, available = _number(block.get("remaining")), _number(block.get("available"))
+            if remaining is not None:
+                return Balance(str(data.get("plan_name") or ""), remaining, remaining if available is None else available,
+                               str(data.get("reset_date") or ""))
+        return None
 
     def find_contacts(self, target: Target, *, per_domain: int = PER_DOMAIN_DEFAULT, broad: bool = True,
                       min_confidence: int = MIN_CONFIDENCE_DEFAULT) -> LookupResult:
@@ -542,6 +586,72 @@ def build_backend(name: str, api_key: str, *, session: Any = None, reveal_cap: i
     return HunterBackend(api_key, session=session, sleep=sleep)
 
 
+# --------------------------------------------------------------------------- remembering dead ends
+class LookupLog:
+    """Local memory of brands that were searched and had no usable contact.
+
+    Hunter charges a credit whenever a search returns anyone, even people we then discard (a VP, a
+    generic inbox), and a brand that never got a sheet row would be searched again on every run. This
+    file remembers those brands for a while. It is only a cache: if it is missing or damaged it starts
+    over, which costs a few credits and nothing else. It lives in data/, which is gitignored.
+    """
+
+    def __init__(self, path: Path | None = None):
+        self.path = Path(path) if path is not None else None
+        self.entries: dict[str, dict[str, str]] = {}
+        self.damaged = False
+        self.changed = False
+        if self.path is not None and self.path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            dead = raw["dead_ends"]
+            if not isinstance(dead, dict):
+                raise TypeError("dead_ends is not an object")
+            entries = {}
+            for key, entry in dead.items():
+                when = date.fromisoformat(entry["date"])
+                entries[str(key)] = {"company": str(entry.get("company") or ""), "date": when.isoformat()}
+            self.entries = entries
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            self.entries = {}
+            self.damaged = True
+
+    def skip_reason(self, key: str, today: date, recheck_days: int) -> str:
+        """Why this brand should not be searched yet, or "" if it should be."""
+        entry = self.entries.get(key)
+        if entry is None or recheck_days <= 0:
+            return ""
+        when = date.fromisoformat(entry["date"])
+        if when > today or (today - when).days >= recheck_days:
+            return ""  # a date in the future means the clock moved: do not trust it
+        retry = when + timedelta(days=recheck_days)
+        return (f"searched on {when.isoformat()} with no usable contact; it will be searched again on "
+                f"{retry.isoformat()} (or now with --recheck-days 0)")
+
+    def record(self, key: str, company: str, today: date) -> None:
+        self.entries[key] = {"company": company, "date": today.isoformat()}
+        self.changed = True
+
+    def forget(self, key: str) -> None:
+        if self.entries.pop(key, None) is not None:
+            self.changed = True
+
+    def save(self) -> None:
+        """Write the file atomically. Does nothing when nothing changed."""
+        if self.path is None or not self.changed:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        payload = {"version": 1, "dead_ends": dict(sorted(self.entries.items()))}
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
+        self.changed = False
+        self.damaged = False
+
+
 # --------------------------------------------------------------------------- running a discovery batch
 @dataclass
 class DiscoveryReport:
@@ -553,13 +663,21 @@ class DiscoveryReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
     remaining: int = 0
     aborted: str = ""
+    found_keys: list[str] = field(default_factory=list)  # Target.key of brands that yielded contacts
+    dead_end_keys: list[str] = field(default_factory=list)  # brands searched to the end with no usable contact
 
 
 def plan_lookups(targets: Sequence[Target], *, existing_domains: Iterable[str] = (), banned_brands: Iterable[str] = (),
-                 limit: int | None = LOOKUP_LIMIT_DEFAULT) -> tuple[list[Target], list[tuple[str, str]], int]:
-    """(brands that would be looked up, brands skipped with the reason, brands left because of the limit)."""
+                 limit: int | None = LOOKUP_LIMIT_DEFAULT,
+                 remembered: Mapping[str, str] | None = None) -> tuple[list[Target], list[tuple[str, str]], int]:
+    """(brands that would be looked up, brands skipped with the reason, brands left because of the limit).
+
+    `remembered` maps Target.key to the reason a recently searched brand is left alone; those brands
+    are skipped before the limit is counted, so they never use up a slot.
+    """
     have = set(existing_domains)
     banned = tuple(banned_brands)
+    remembered = remembered or {}
     todo: list[Target] = []
     skipped: list[tuple[str, str]] = []
     left = 0
@@ -568,6 +686,8 @@ def plan_lookups(targets: Sequence[Target], *, existing_domains: Iterable[str] =
             skipped.append((target.company, "existing partner (BANNED_BRANDS)"))
         elif target.domain and target.domain in have:
             skipped.append((target.company, f"{target.domain} is already in the sheet"))
+        elif target.key in remembered:
+            skipped.append((target.company, remembered[target.key]))
         elif limit is not None and len(todo) >= limit:
             left += 1
         else:
@@ -585,8 +705,10 @@ def discover(
     broad: bool = True,
     min_confidence: int = MIN_CONFIDENCE_DEFAULT,
     limit: int | None = LOOKUP_LIMIT_DEFAULT,
+    remembered: Mapping[str, str] | None = None,
 ) -> DiscoveryReport:
-    todo, skipped, left = plan_lookups(targets, existing_domains=existing_domains, banned_brands=banned_brands, limit=limit)
+    todo, skipped, left = plan_lookups(targets, existing_domains=existing_domains, banned_brands=banned_brands, limit=limit,
+                                       remembered=remembered)
     report = DiscoveryReport(skipped=skipped, remaining=left)
     found_emails: set[str] = set()
     for index, target in enumerate(todo):
@@ -608,7 +730,10 @@ def discover(
             report.remaining += len(todo) - index - (1 if fresh else 0)
         elif not fresh:
             report.without_contacts.append(target.company)
+            report.dead_end_keys.append(target.key)
             continue
+        if fresh:
+            report.found_keys.append(target.key)
         for contact in fresh:
             found_emails.add(contact.email)
             detail = f"{backend.name}: {contact.position or 'title unknown'}, confidence {contact.confidence}"

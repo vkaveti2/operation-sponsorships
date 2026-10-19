@@ -7,6 +7,17 @@ from logging.handlers import RotatingFileHandler
 from config.settings import LOGS_DIR
 
 
+NOISY_LOGGERS = ("urllib3", "httpx", "httpx2", "httpcore", "googleapiclient", "google_auth_httplib2", "google_genai")
+
+
+def quiet_noisy_loggers(verbose: bool) -> None:
+    """Third-party libraries narrate every request at INFO (Gemini prints 'AFC is enabled ...'). Hide that
+    unless --verbose, in the console and in logs/outreach.log."""
+    level = logging.DEBUG if verbose else logging.WARNING
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+
 def setup_logging(verbose: bool = False) -> None:
     root = logging.getLogger()
     if getattr(root, "_outreach_configured", False):
@@ -31,7 +42,5 @@ def setup_logging(verbose: bool = False) -> None:
     except OSError as exc:  # read-only checkout, etc. Console logging still works.
         root.warning("Could not open logs/outreach.log (%s). Continuing without a log file.", exc)
 
-    # Chatty third-party loggers stay quiet unless --verbose.
-    for noisy in ("urllib3", "httpx", "httpx2", "httpcore", "googleapiclient", "google_auth_httplib2"):
-        logging.getLogger(noisy).setLevel(logging.DEBUG if verbose else logging.WARNING)
+    quiet_noisy_loggers(verbose)
     root._outreach_configured = True  # type: ignore[attr-defined]

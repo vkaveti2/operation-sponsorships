@@ -5,6 +5,7 @@
     python main.py init-sheet     create the review sheet
     python main.py import         add contacts you already have (CSV or another Google Sheet)
     python main.py discover       find contacts at brands with Hunter or Apollo, then add them
+    python main.py try-draft      write one sample email with the real model (no Google login needed)
     python main.py draft          write emails for Pending rows
     python main.py send           create Gmail drafts for Approved rows  (--live to really send)
     python main.py sync           mark rows Sent once you have sent their drafts by hand
@@ -32,13 +33,13 @@ from config.errors import ConfigError, OutreachError
 from config.logging_setup import setup_logging
 from config.settings import (
     CREDENTIALS_FILE, DATA_DIR, ENV_FILE, LOGS_DIR, MAX_DELAY_SECONDS, MIN_DELAY_SECONDS, PROJECT_ROOT, TOKEN_FILE,
-    Approval, SendStatus, Settings, mask, update_env_file,
+    Approval, Col, SendStatus, Settings, mask, season_context, update_env_file,
 )
 from src import discovery as disc
-from src.drafter import DEFAULT_LIMIT, Drafter
+from src.drafter import DEFAULT_LIMIT, Drafter, build_system_prompt, build_user_prompt, pick_angle
 from src.llm import LLMClient, build_llm
 from src.mailer import GmailApi, Mailer, count_sent_since, local_now
-from src.models import LeadRow
+from src.models import LeadRow, normalize_category
 from src.sheet_manager import DEFAULT_TITLE, SheetManager, same
 
 log = logging.getLogger(__name__)
@@ -52,8 +53,8 @@ REQUIRED_MODULES = {
     "dotenv": "python-dotenv", "requests": "requests",
 }
 KEY_HINTS = {
-    "anthropic": ("Claude", "ANTHROPIC_API_KEY", "sk-ant-", "https://platform.claude.com/settings/keys"),
-    "gemini": ("Gemini", "GEMINI_API_KEY", "AIza", "https://aistudio.google.com/apikey"),
+    "anthropic": ("Claude", "ANTHROPIC_API_KEY", ("sk-ant-",), "https://platform.claude.com/settings/keys"),
+    "gemini": ("Gemini", "GEMINI_API_KEY", ("AIza", "AQ."), "https://aistudio.google.com/apikey"),
 }
 
 
@@ -72,6 +73,7 @@ class Runtime:
         interactive: bool | None = None,
         today: date | None = None,
         env_path: Path = ENV_FILE,
+        lookups_path: Path = DATA_DIR / "lookups.json",
         creds: Any = None,
         gspread_client: Any = None,
         sheet: SheetManager | None = None,
@@ -87,6 +89,7 @@ class Runtime:
         self.interactive = sys.stdin.isatty() if interactive is None else interactive
         self.today = today
         self.env_path = env_path
+        self.lookups_path = lookups_path
         self.sleep, self.clock = sleep, clock
         self._creds, self._gspread, self._sheet, self._gmail, self._llm, self._backend = creds, gspread_client, sheet, gmail, llm, backend
 
@@ -126,6 +129,10 @@ class Runtime:
         if self._backend is None:
             self._backend = disc.build_backend(name, self.settings.discovery_key(name), reveal_cap=reveal_cap, sleep=self.sleep)
         return self._backend
+
+    def hunter_ready(self) -> bool:
+        """True when a Hunter call can be made: a key is configured, or a backend was supplied (tests)."""
+        return bool(self.settings.hunter_api_key) or self._backend is not None
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -182,7 +189,8 @@ def cmd_configure(rt: Runtime, args: argparse.Namespace) -> int:
         key = rt.ask_secret(f"Paste your {label} API key from {url}\n(typing is hidden; Enter keeps the current one: {have}): ").strip().strip("\"'")
     if key:
         if not _looks_right(provider, key):
-            rt.say(f"Note: {label} keys normally start with {KEY_HINTS[provider][2]}. Saving it anyway; `doctor --online` will tell you if it works.")
+            prefixes = " or ".join(KEY_HINTS[provider][2])
+            rt.say(f"Note: {label} keys normally start with {prefixes}. Saving it anyway; `doctor --online` will tell you if it works.")
         updates[env_name] = key
 
     if rt.interactive and not args.key_from_stdin:
@@ -197,7 +205,12 @@ def cmd_configure(rt: Runtime, args: argparse.Namespace) -> int:
 
     update_env_file(updates, path=rt.env_path)
     rt.say(f"Saved to {rt.env_path.name}: " + ", ".join(f"{k}={mask(v) if 'KEY' in k else v}" for k, v in updates.items()))
+    if provider == "gemini":
+        rt.say("Privacy note: on Gemini's free tier Google may use prompts to improve its products (a paid-tier key does not). "
+               "The model is only ever sent company names, categories and your optional notes, never contact names or emails. "
+               "See exactly what with: python main.py try-draft --show-prompt")
 
+    key_ok = False
     if key and not args.no_check:
         fresh = dataclasses.replace(
             s, llm_provider=provider,
@@ -205,10 +218,14 @@ def cmd_configure(rt: Runtime, args: argparse.Namespace) -> int:
         )
         try:
             rt.say(f"Checking the key... {build_llm(fresh).check()}.")
+            key_ok = True
         except OutreachError as exc:
             rt.say(f"Saved, but the check failed: {exc}")
             return 1
-    rt.say("Next: python main.py auth" if not TOKEN_FILE.exists() else "Next: python main.py doctor --online")
+    if key_ok:
+        rt.say("Next: python main.py try-draft   (writes one real sample email; no Google login needed)")
+    else:
+        rt.say("Next: python main.py auth" if not TOKEN_FILE.exists() else "Next: python main.py doctor --online")
     return 0
 
 
@@ -289,6 +306,25 @@ def cmd_import(rt: Runtime, args: argparse.Namespace) -> int:
     return 0
 
 
+def _show_hunter_balance(rt: Runtime, worst_case: int) -> disc.Balance | None:
+    """Print the real Hunter credit balance (a free call). Never fails the command: None when it cannot be read."""
+    if not rt.hunter_ready():
+        return None
+    try:
+        fetch = getattr(rt.backend("hunter"), "balance", None)
+        balance = fetch() if fetch else None
+    except OutreachError as exc:
+        rt.say(f"(Could not read your Hunter balance: {exc})")
+        return None
+    if balance is None:
+        return None
+    rt.say(f"Your Hunter plan ({balance.plan or 'unknown'}): {balance.remaining:g} of {balance.available:g} credits left"
+           + (f", resetting {balance.reset_date}." if balance.reset_date else "."))
+    if balance.remaining < worst_case:
+        rt.say(f"That is fewer than the {worst_case} this run could use, so it stops when the credits run out and keeps what it found.")
+    return balance
+
+
 def cmd_discover(rt: Runtime, args: argparse.Namespace) -> int:
     s = rt.settings
     backend_name = (args.backend or s.discovery_backend).lower()
@@ -302,17 +338,31 @@ def cmd_discover(rt: Runtime, args: argparse.Namespace) -> int:
         if not args.dry_run:
             raise
         rt.say(f"(Could not read the review sheet to skip brands already in it: {exc})")
-    todo, skipped, left = disc.plan_lookups(parsed.lookups, existing_domains=existing, banned_brands=s.banned_brands, limit=args.limit)
+    memory = disc.LookupLog(rt.lookups_path)
+    if memory.damaged:
+        rt.say(f"(Could not read {rel(rt.lookups_path)}, so every brand counts as not searched yet.)")
+    today = rt.today or date.today()
+    remembered = {t.key: why for t in parsed.lookups if (why := memory.skip_reason(t.key, today, args.recheck_days))}
+    todo, skipped, left = disc.plan_lookups(parsed.lookups, existing_domains=existing, banned_brands=s.banned_brands, limit=args.limit,
+                                            remembered=remembered)
     for company, reason in skipped:
         rt.say(f"  skipping {company}: {reason}")
     rt.say(f"{plural(len(todo), 'brand')} to look up with {backend_name.title()}" + (f", {left} more waiting (raise --limit to include them)" if left else "")
            + (f"; {plural(len(parsed.contacts), 'contact')} already have an email and are added directly." if parsed.contacts else "."))
+    out_of_credits = False
     if backend_name == "apollo":
         rt.say(f"Apollo uses about 1 credit per email revealed (up to {args.per_domain} per brand, capped at {args.max_reveals} this run).")
     else:
-        rt.say("Hunter charges 1 credit for each search that returns results (1 to 10 emails). A brand can take a second, wider search "
-               f"when no exact title matches, so budget up to {2 * len(todo)} credits for this run. Hunter's free plan includes 50 credits a month; "
-               "add --no-broad to cap it at one credit per brand.")
+        worst = len(todo) * (1 if args.no_broad else 2)
+        rt.say("Hunter charges 1 credit for each search that returns results (1 to 10 emails). "
+               + ("--no-broad is on, so each brand takes one search" if args.no_broad else "A brand can take a second, wider search when no exact title matches")
+               + f", so budget up to {worst} credits for this run. Hunter's free plan includes 50 credits a month"
+               + ("." if args.no_broad else "; add --no-broad to cap it at one credit per brand."))
+        balance = _show_hunter_balance(rt, worst)
+        if balance is not None and balance.remaining < 1 and todo and not args.dry_run:
+            rt.say("No Hunter credits left, so no brands were looked up" + (f" (they reset on {balance.reset_date})" if balance.reset_date else "")
+                   + ". `import --csv` still works with contacts you already have.")
+            todo, out_of_credits = [], True
     if args.dry_run:
         for target in todo:
             rt.say(f"  would look up: {target.company} ({target.domain or 'domain unknown, by name'}) [{target.category or 'no category'}]")
@@ -327,10 +377,20 @@ def cmd_discover(rt: Runtime, args: argparse.Namespace) -> int:
         backend = rt.backend(backend_name, reveal_cap=args.max_reveals if backend_name == "apollo" else None)
         report = disc.discover(todo, backend, existing_domains=existing, banned_brands=s.banned_brands, per_domain=args.per_domain,
                                broad=not args.no_broad, min_confidence=args.min_confidence, limit=None)
+        names = {t.key: t.company for t in todo}
+        for key in report.dead_end_keys:
+            memory.record(key, names.get(key, key), today)
+        for key in report.found_keys:
+            memory.forget(key)
+        try:
+            memory.save()
+        except OSError as exc:
+            rt.say(f"(Could not save {rel(rt.lookups_path)}: {exc}. Brands with no result will be searched again next time.)")
         for company, message in report.errors:
             rt.say(f"  {company}: {message}")
         if report.without_contacts:
-            rt.say("  no usable contact found for: " + ", ".join(report.without_contacts))
+            rt.say("  no usable contact found for: " + ", ".join(report.without_contacts)
+                   + (f" (not searched again for {args.recheck_days} days)" if args.recheck_days > 0 else ""))
         for lead in report.leads:
             rt.say(f"  found: {lead.company}: {lead.target_name or '(no name)'} <{lead.email}>  {clip(lead.notes.replace('[found] ', ''), 70)}")
     added, dupes = _add_to_sheet(rt, report.leads) if report.leads else (0, 0)
@@ -343,7 +403,7 @@ def cmd_discover(rt: Runtime, args: argparse.Namespace) -> int:
     if total_added:
         rt.say(sheet_hint(rt))
         rt.say("Next: python main.py draft")
-    return finish_code(aborted=report.aborted)
+    return finish_code(aborted=report.aborted, problem=out_of_credits)
 
 
 # --------------------------------------------------------------------------- draft
@@ -372,6 +432,56 @@ def cmd_draft(rt: Runtime, args: argparse.Namespace) -> int:
     if report.failed and not report.aborted:
         rt.say("Failed rows stay Pending with the reason in the Notes column. Fix the row (or its Custom Hook / Angle) and run draft again.")
     return finish_code(aborted=report.aborted)
+
+
+def _next_step_after_model_works(rt: Runtime) -> str:
+    if not TOKEN_FILE.exists():
+        return "Next: python main.py auth   (sign in to Google as the club account)"
+    if not rt.settings.spreadsheet_id:
+        return "Next: python main.py init-sheet"
+    return "Next: python main.py status"
+
+
+def cmd_try_draft(rt: Runtime, args: argparse.Namespace) -> int:
+    """One sample email with the real model. Needs only the model key: no Google login, no sheet, nothing saved."""
+    s = rt.settings
+    company = (args.company or "").strip()
+    category = normalize_category(args.category) or (args.category or "").strip()
+    row = LeadRow({
+        Col.ROW_ID: "PREVIEW", Col.COMPANY: company, Col.CATEGORY: category, Col.TARGET_NAME: (args.name or "").strip(),
+        Col.TARGET_EMAIL: "preview@example.com", Col.HOOK: (args.hook or "").strip(),
+    })
+    llm = rt.llm()
+    rt.say(f"Writing a sample email for {company or '(no company)'} ({category or 'no category'}) with {llm.provider} ({llm.model}).")
+    rt.say("Nothing is saved or sent, and no Google login is needed.")
+    if args.show_prompt:
+        season = season_context(rt.today or date.today())
+        rt.say("\n--- exactly what the model is sent ---\nSYSTEM:\n" + build_system_prompt(s.sender, season)
+               + "\n\nUSER:\n" + build_user_prompt(row, pick_angle(row), season) + "\n--------------------------------------")
+    outcome, report = Drafter(s, None, llm, today=rt.today).preview(row)
+    usage = f"Model usage: {report.input_tokens:,} tokens in, {report.output_tokens:,} out."
+
+    if outcome.status == "preview":
+        tries = "1 try" if outcome.attempts == 1 else f"{outcome.attempts} tries"
+        rt.say(f"\nSubject: {outcome.subject}\n\n{outcome.email}\n")
+        rt.say(f"Passed every rule check ({tries}). {usage}")
+        rt.say("`python main.py draft` writes emails like this into the sheet for you to approve.")
+        rt.say(_next_step_after_model_works(rt))
+        return 0
+    if outcome.status == "skipped":
+        rt.say(f"\nNothing was written: {outcome.reason}")
+        return 1
+    if outcome.problems:
+        rt.say(f"\nThe model's draft broke these rules after {outcome.attempts} tries, so `draft` would have rejected it:")
+        for problem in outcome.problems:
+            rt.say(f"  - {problem}")
+        rt.say("\nIts last attempt, for reference:\n" + (outcome.raw.strip() or "(empty)") + "\n")
+        rt.say(usage)
+        rt.say("In the real flow the row stays Pending with these reasons in Notes. If this happens every time, the prompt in src/drafter.py needs tuning for this model.")
+        return 1
+    rt.say(f"\nThe model did not produce a draft: {outcome.reason}")
+    rt.say(usage)
+    return 1
 
 
 # --------------------------------------------------------------------------- send / sync
@@ -608,6 +718,17 @@ def online_checks(rt: Runtime) -> list[Check]:
         attempt("Review sheet", sheet_check)
     else:
         checks.append(("skip", "Review sheet", "needs the Google login and a sheet first"))
+
+    def hunter() -> str:
+        fetch = getattr(rt.backend("hunter"), "balance", None)
+        balance = fetch() if fetch else None
+        if balance is None:
+            return "key accepted (the credit balance was not in the reply)"
+        return (f"plan {balance.plan or 'unknown'}: {balance.remaining:g} of {balance.available:g} credits left"
+                + (f", resets {balance.reset_date}" if balance.reset_date else ""))
+
+    if s.hunter_api_key:
+        attempt("Hunter key and credits", hunter)
     return checks
 
 
@@ -664,7 +785,16 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--min-confidence", type=int, default=disc.MIN_CONFIDENCE_DEFAULT, metavar="N", help="drop addresses below this confidence (default %(default)s)")
             p.add_argument("--no-broad", action="store_true", help="Hunter: skip the second, wider search when no exact title matches")
             p.add_argument("--max-reveals", type=int, default=20, metavar="N", help="Apollo: most emails to unlock this run (default %(default)s)")
+            p.add_argument("--recheck-days", type=int, default=disc.RECHECK_DAYS_DEFAULT, metavar="N",
+                           help="skip brands searched with no usable contact in the last N days (default %(default)s; 0 searches everything again)")
             p.add_argument("--dry-run", action="store_true", help="show what would be looked up; spend nothing, add nothing")
+
+    p = sub.add_parser("try-draft", help="write one sample email with the real model (no Google login needed; saves and sends nothing)")
+    p.add_argument("--company", default="CeraVe", help="default: %(default)s")
+    p.add_argument("--category", default="Skincare", help="Energy, Skincare, Hydration, Recovery or Gear (default %(default)s)")
+    p.add_argument("--name", default="Jane Doe", help="contact name, used only for the greeting and never sent to the model (default %(default)s)")
+    p.add_argument("--hook", help="optional Custom Hook / Angle note for the opening")
+    p.add_argument("--show-prompt", action="store_true", help="also print exactly what is sent to the model")
 
     p = sub.add_parser("draft", help="write emails for Pending rows")
     p.add_argument("--limit", type=int, default=DEFAULT_LIMIT, metavar="N", help="most emails to write this run (default %(default)s)")
@@ -686,7 +816,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS: dict[str, Callable[[Runtime, argparse.Namespace], int]] = {
     "configure": cmd_configure, "auth": cmd_auth, "init-sheet": cmd_init_sheet, "import": cmd_import, "discover": cmd_discover,
-    "draft": cmd_draft, "send": cmd_send, "sync": cmd_sync, "status": cmd_status, "doctor": cmd_doctor,
+    "try-draft": cmd_try_draft, "draft": cmd_draft, "send": cmd_send, "sync": cmd_sync, "status": cmd_status, "doctor": cmd_doctor,
 }
 
 

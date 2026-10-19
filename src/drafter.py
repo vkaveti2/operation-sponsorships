@@ -196,6 +196,8 @@ class DraftOutcome:
     subject: str = ""
     email: str = ""
     attempts: int = 0
+    problems: tuple[str, ...] = ()  # the rules a failed draft broke, kept so a preview can list them
+    raw: str = ""  # the model's last reply, kept so a failed preview can show what it wrote
 
 
 @dataclass
@@ -228,7 +230,7 @@ class DraftReport:
 
 # --------------------------------------------------------------------------- drafter
 class Drafter:
-    def __init__(self, settings: Settings, sheet: SheetManager, llm: LLMClient, *,
+    def __init__(self, settings: Settings, sheet: SheetManager | None, llm: LLMClient, *,
                  today: date | None = None, max_attempts: int = MAX_ATTEMPTS):
         self.settings = settings
         self.sheet = sheet
@@ -283,6 +285,16 @@ class Drafter:
             report.outcomes.append(outcome)
         return report
 
+    def preview(self, row: LeadRow) -> tuple[DraftOutcome, DraftReport]:
+        """Draft one email for an in-memory row. Touches no sheet, so it works before Google is set up."""
+        report = DraftReport()
+        skip = self._skip_reason(row)
+        if skip:
+            return DraftOutcome(row.row_id, row.label(), "skipped", skip), report
+        season = season_context(self.today or date.today())
+        system = build_system_prompt(self.settings.sender, season)
+        return self._draft_one(row, system, season, report, dry_run=True), report
+
     # ---- one row
     def _skip_reason(self, row: LeadRow) -> str:
         if not normalize_email(row.email):
@@ -329,7 +341,8 @@ class Drafter:
 
         summary = " / ".join(problems)
         self._write_note(row, f"draft rejected after {self.max_attempts} tries: {summary}", dry_run)
-        return DraftOutcome(row.row_id, row.label(), "failed", summary, attempts=self.max_attempts)
+        return DraftOutcome(row.row_id, row.label(), "failed", summary, attempts=self.max_attempts,
+                            problems=tuple(problems), raw=previous)
 
     def _finish(self, row: LeadRow, subject: str, body: str, attempts: int, dry_run: bool) -> DraftOutcome:
         email = assemble_email(self.settings.sender, row.target_name, row.company, body)

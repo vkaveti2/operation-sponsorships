@@ -1,9 +1,11 @@
+import logging
 import stat
 from datetime import date
 
 import pytest
 
 from config.errors import ConfigError
+from config.logging_setup import NOISY_LOGGERS, quiet_noisy_loggers
 from config.settings import (
     HARD_CAP_PER_RUN, MAX_DELAY_SECONDS, MIN_DELAY_SECONDS, REQUIRED_PARTNER_LINE, Sender, Settings,
     mask, parse_spreadsheet_id, season_context, update_env_file,
@@ -111,3 +113,19 @@ def test_mask_hides_most_of_a_secret():
     assert mask("") == "(not set)"
     assert mask("sk-ant-api03-abcdefghijkl") == "sk-a...jkl"
     assert mask("short") == "set"
+
+
+def test_chatty_library_loggers_are_hidden_unless_verbose():
+    saved = {name: logging.getLogger(name).level for name in NOISY_LOGGERS}
+    try:
+        quiet_noisy_loggers(False)
+        assert "google_genai" in NOISY_LOGGERS
+        for name in NOISY_LOGGERS:
+            assert not logging.getLogger(name).isEnabledFor(logging.INFO), name
+        sdk = logging.getLogger("google_genai.models")  # the logger behind "AFC is enabled with max remote calls"
+        assert not sdk.isEnabledFor(logging.INFO) and sdk.isEnabledFor(logging.WARNING)
+        quiet_noisy_loggers(True)
+        assert sdk.isEnabledFor(logging.DEBUG)
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)

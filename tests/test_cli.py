@@ -1,10 +1,11 @@
+import json
 import stat
 from datetime import timedelta
 
 import pytest
 
 import src.cli as C
-from config.errors import DiscoveryAuthError, LLMAuthError, QuotaExceeded
+from config.errors import DiscoveryAuthError, DiscoveryError, LLMAuthError, QuotaExceeded
 from config.settings import COLUMNS, Col
 from src import discovery as D
 from src.cli import classify, main
@@ -461,3 +462,285 @@ def test_doctor_online_survives_surprising_library_errors(isolated):
     h.rt._llm.check = lambda: (_ for _ in ()).throw(ConnectionResetError("boom"))
     assert h.run("doctor", "--online") == 1 and "ConnectionResetError: boom" in h.text
     assert GOOD_BODY  # keep the shared sample import used
+
+
+# --------------------------------------------------------------------------- try-draft
+class Untouchable:
+    """Stands in for Google objects. Any use at all fails the test."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"this command must not touch Google (tried .{name})")
+
+
+def offline_harness(tmp_path, *script, **kwargs):
+    llm = FakeLLM(*script)
+    return Harness(tmp_path, env={}, llm=llm, sheet=Untouchable(), gmail=Untouchable(), creds=Untouchable(),
+                   gspread_client=Untouchable(), **kwargs), llm
+
+
+def test_try_draft_writes_a_sample_email_and_never_touches_google(tmp_path):
+    from tests.samples import GOOD_MODEL_TEXT, GOOD_SUBJECT
+    h, llm = offline_harness(tmp_path, GOOD_MODEL_TEXT)
+    assert h.run("try-draft") == 0
+    assert f"Subject: {GOOD_SUBJECT}" in h.text and "Hi Jane," in h.text and "Personal Instagram: @varunkaveti" in h.text
+    assert "Passed every rule check (1 try)" in h.text and "100 tokens in, 200 out" in h.text
+    assert "no Google login is needed" in h.text and "with fake (fake-1)" in h.text
+    assert "Next: python main.py auth" in h.text and len(llm.calls) == 1
+
+
+def test_try_draft_uses_the_company_category_and_hook_you_give_it(tmp_path):
+    from tests.samples import GOOD_MODEL_TEXT
+    h, llm = offline_harness(tmp_path, GOOD_MODEL_TEXT)
+    assert h.run("try-draft", "--company", "Nuun", "--category", "electrolytes", "--hook", "their new tablets", "--name", "Sam Lee") == 0
+    prompt = llm.calls[0][1]
+    assert "Company: Nuun" in prompt and "Category: Hydration" in prompt and "their new tablets" in prompt
+    assert "Hi Sam," in h.text and "Sam" not in prompt  # the contact name only ever reaches the greeting
+
+
+def test_try_draft_show_prompt_prints_exactly_what_is_sent_and_no_contact_data(tmp_path):
+    from tests.samples import GOOD_MODEL_TEXT
+    h, llm = offline_harness(tmp_path, GOOD_MODEL_TEXT)
+    assert h.run("try-draft", "--show-prompt") == 0
+    block = next(line for line in h.lines if "exactly what the model is sent" in line)
+    assert "SYSTEM:" in block and "USER:" in block and "<lead>" in block and "Company: CeraVe" in block
+    assert block.count(llm.calls[0][0]) == 1 and llm.calls[0][1] in block  # the printed text is the real request
+    assert "Jane" not in block and "preview@example.com" not in block
+
+
+def test_try_draft_explains_a_draft_that_breaks_the_rules(tmp_path):
+    from tests.samples import model_text
+    h, _ = offline_harness(tmp_path, model_text(body="Short and wrong. Celsius is great."))
+    assert h.run("try-draft") == 1
+    assert "broke these rules after 2 tries" in h.text and "Celsius" in h.text and "required sentence" in h.text
+    assert "Its last attempt" in h.text and "Short and wrong." in h.text and "needs tuning" in h.text
+
+
+def test_try_draft_with_a_rejected_key_prints_one_line_and_exits_1(tmp_path, capsys):
+    h, _ = offline_harness(tmp_path, LLMAuthError("Google rejected GEMINI_API_KEY"))
+    assert h.run("try-draft") == 1
+    assert capsys.readouterr().err.strip() == "Error: Google rejected GEMINI_API_KEY"
+
+
+def test_try_draft_without_a_key_says_how_to_fix_it(tmp_path, capsys):
+    h = Harness(tmp_path, env={}, llm=None, sheet=Untouchable(), gmail=Untouchable(), creds=Untouchable())
+    assert h.run("try-draft") == 1 and "ANTHROPIC_API_KEY is empty" in capsys.readouterr().err
+
+
+def test_try_draft_reports_a_model_refusal_and_a_banned_company(tmp_path):
+    from config.errors import LLMRefusal
+    h, _ = offline_harness(tmp_path, LLMRefusal("declined"))
+    assert h.run("try-draft") == 1 and "did not produce a draft: declined" in h.text
+    h2, llm2 = offline_harness(tmp_path, "unused")
+    assert h2.run("try-draft", "--company", "Celsius") == 1 and "BANNED_BRANDS" in h2.text and not llm2.calls
+
+
+def test_try_draft_runs_with_no_env_file_and_no_sheet_setting(tmp_path):
+    from tests.samples import GOOD_MODEL_TEXT
+    h, _ = offline_harness(tmp_path, GOOD_MODEL_TEXT)
+    assert not h.env_path.exists() and h.settings.spreadsheet_id == "" and h.run("try-draft") == 0 and not h.env_path.exists()
+
+
+# --------------------------------------------------------------------------- configure: privacy note and next step
+def good_check(monkeypatch):
+    monkeypatch.setattr(C, "build_llm", lambda settings: type("L", (), {"check": lambda self: "key accepted"})())
+
+
+def test_configure_gemini_explains_the_free_tier_privacy_tradeoff(isolated, monkeypatch):
+    good_check(monkeypatch)
+    h = Harness(isolated, env={}, read_stdin=lambda: "AIza-fake1")
+    assert h.run("configure", "--provider", "gemini", "--key-from-stdin") == 0
+    assert "Privacy note" in h.text and "free tier" in h.text and "never contact names or emails" in h.text
+    assert "try-draft --show-prompt" in h.text
+
+
+def test_configure_claude_has_no_gemini_privacy_note(isolated, monkeypatch):
+    good_check(monkeypatch)
+    h = Harness(isolated, env={}, read_stdin=lambda: "sk-ant-fake1")
+    assert h.run("configure", "--provider", "anthropic", "--key-from-stdin") == 0 and "Privacy note" not in h.text
+
+
+def test_configure_points_to_try_draft_after_a_working_key_and_to_auth_otherwise(isolated, monkeypatch):
+    good_check(monkeypatch)
+    ok = Harness(isolated, env={}, read_stdin=lambda: "AIza-fake1")
+    ok.run("configure", "--provider", "gemini", "--key-from-stdin")
+    assert "Next: python main.py try-draft" in ok.text
+    unchecked = Harness(isolated, env={}, read_stdin=lambda: "AIza-fake1")
+    unchecked.run("configure", "--provider", "gemini", "--key-from-stdin", "--no-check")
+    assert "Next: python main.py auth" in unchecked.text and "Next: python main.py try-draft" not in unchecked.text
+
+
+# --------------------------------------------------------------------------- discover: credits and memory
+class Rich(Stub):
+    """A lookup backend that can also report a credit balance, like Hunter."""
+
+    def __init__(self, script, balance):
+        super().__init__(script)
+        self._balance, self.balance_calls = balance, 0
+
+    def balance(self):
+        self.balance_calls += 1
+        if isinstance(self._balance, Exception):
+            raise self._balance
+        return self._balance
+
+
+def credits(remaining, available=50, plan="Free", reset="2026-11-19"):
+    return D.Balance(plan, remaining, available, reset)
+
+
+def test_discover_shows_your_real_hunter_balance(h, brands_csv):
+    h.rt._backend = Rich({"Red Bull": found("jo@redbull.com", "redbull.com")}, credits(50))
+    assert h.run("discover", "--csv", str(brands_csv)) == 0
+    assert "Your Hunter plan (Free): 50 of 50 credits left, resetting 2026-11-19." in h.text
+    assert "fewer than" not in h.text and h.rt._backend.balance_calls == 1
+
+
+def test_discover_warns_when_the_balance_is_below_the_worst_case(h, brands_csv):
+    h.rt._backend = Rich({}, credits(4))
+    assert h.run("discover", "--csv", str(brands_csv), "--dry-run") == 0  # 3 brands, up to 2 searches each
+    assert "4 of 50 credits left" in h.text and "fewer than the 6 this run could use" in h.text
+
+
+@pytest.mark.parametrize("left", [0, 0.5])
+def test_discover_stops_cleanly_when_hunter_has_no_credit_left(h, brands_csv, left):
+    backend = Rich({"Red Bull": found("jo@redbull.com", "redbull.com")}, credits(left))
+    h.rt._backend = backend
+    assert h.run("discover", "--csv", str(brands_csv)) == 1
+    assert backend.seen == [] and h.sheet.read_rows() == [] and not h.lookups_path.exists()
+    assert "No Hunter credits left" in h.text and "2026-11-19" in h.text and "import --csv" in h.text
+
+
+def test_a_dry_run_still_previews_when_credits_are_gone(h, brands_csv):
+    h.rt._backend = Rich({}, credits(0))
+    assert h.run("discover", "--csv", str(brands_csv), "--dry-run") == 0
+    assert "would look up: Red Bull" in h.text and "No Hunter credits left" not in h.text
+
+
+@pytest.mark.parametrize("balance,shown", [(DiscoveryError("Hunter is down"), "Could not read your Hunter balance: Hunter is down"), (None, "")])
+def test_discover_still_runs_when_the_balance_cannot_be_read(h, brands_csv, balance, shown):
+    h.rt._backend = Rich({"Red Bull": found("jo@redbull.com", "redbull.com")}, balance)
+    assert h.run("discover", "--csv", str(brands_csv)) == 0
+    assert [r.company for r in h.sheet.read_rows()] == ["Red Bull"] and "Your Hunter plan" not in h.text
+    if shown:
+        assert shown in h.text
+
+
+def test_discover_with_apollo_never_asks_for_a_hunter_balance(h, brands_csv):
+    backend = Rich({}, credits(0))
+    h.rt._backend = backend
+    assert h.run("discover", "--csv", str(brands_csv), "--backend", "apollo") == 0
+    assert backend.balance_calls == 0 and "Hunter" not in h.text.replace("Hunter or Apollo", "")
+
+
+def test_brands_with_no_usable_contact_are_not_searched_again_for_30_days(h, brands_csv):
+    backend = Rich({"Red Bull": found("jo@redbull.com", "redbull.com")}, credits(50))  # CeraVe and Nuun come back empty
+    h.rt._backend = backend
+    assert h.run("discover", "--csv", str(brands_csv)) == 0
+    saved = json.loads(h.lookups_path.read_text())["dead_ends"]
+    assert set(saved) == {"cerave.com", "nuunlife.com"} and saved["cerave.com"] == {"company": "CeraVe", "date": "2026-10-18"}
+    assert "not searched again for 30 days" in h.text
+
+    h.lines.clear()
+    backend.seen.clear()
+    assert h.run("discover", "--csv", str(brands_csv)) == 0
+    assert backend.seen == []  # Red Bull is in the sheet; the other two are remembered
+    assert "skipping CeraVe: searched on 2026-10-18 with no usable contact; it will be searched again on 2026-11-17" in h.text
+    assert "skipping Red Bull: redbull.com is already in the sheet" in h.text
+
+
+def test_recheck_days_zero_searches_remembered_brands_again(h, brands_csv):
+    backend = Rich({}, credits(50))
+    h.rt._backend = backend
+    h.run("discover", "--csv", str(brands_csv))
+    h.lines.clear()
+    backend.seen.clear()
+    assert h.run("discover", "--csv", str(brands_csv), "--recheck-days", "0") == 0
+    assert sorted(backend.seen) == ["CeraVe", "Nuun", "Red Bull"] and "not searched again" not in h.text
+
+
+def test_a_brand_that_finally_yields_a_contact_is_forgotten(h, brands_csv):
+    old = {"version": 1, "dead_ends": {"cerave.com": {"company": "CeraVe", "date": "2026-06-01"}}}
+    h.lookups_path.write_text(json.dumps(old))
+    h.rt._backend = Rich({"CeraVe": found("al@cerave.com", "cerave.com")}, credits(50))
+    assert h.run("discover", "--csv", str(brands_csv)) == 0  # June is outside the 30 days, so CeraVe is searched again
+    assert [r.company for r in h.sheet.read_rows()] == ["CeraVe"]
+    assert "cerave.com" not in json.loads(h.lookups_path.read_text())["dead_ends"]
+
+
+def test_lookup_errors_and_quota_stops_are_never_remembered_as_dead_ends(h, brands_csv):
+    h.rt._backend = Rich({"Red Bull": DiscoveryError("Red Bull broke"), "CeraVe": QuotaExceeded("plan used up")}, credits(50))
+    assert h.run("discover", "--csv", str(brands_csv)) == 1
+    assert not h.lookups_path.exists()
+
+
+def test_a_damaged_lookup_memory_is_replaced_not_fatal(h, brands_csv):
+    h.lookups_path.write_text("{ this is not json")
+    h.rt._backend = Rich({}, credits(50))
+    assert h.run("discover", "--csv", str(brands_csv)) == 0
+    assert "every brand counts as not searched yet" in h.text
+    assert set(json.loads(h.lookups_path.read_text())["dead_ends"]) == {"redbull.com", "cerave.com", "nuunlife.com"}
+
+
+def test_a_failure_to_save_the_memory_is_reported_but_not_fatal(h, brands_csv, monkeypatch):
+    def refuse(self):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(D.LookupLog, "save", refuse)
+    h.rt._backend = Rich({}, credits(50))
+    assert h.run("discover", "--csv", str(brands_csv)) == 0
+    assert "Could not save" in h.text and "read-only file system" in h.text and "searched again next time" in h.text
+
+
+def test_a_dry_run_respects_the_memory_but_never_writes_it(h, brands_csv):
+    h.lookups_path.write_text(json.dumps({"version": 1, "dead_ends": {"cerave.com": {"company": "CeraVe", "date": "2026-10-10"}}}))
+    before = h.lookups_path.read_text()
+    h.rt._backend = Rich({}, credits(50))
+    assert h.run("discover", "--csv", str(brands_csv), "--dry-run") == 0
+    assert "skipping CeraVe: searched on 2026-10-10" in h.text and "would look up: CeraVe" not in h.text
+    assert h.lookups_path.read_text() == before
+
+
+# --------------------------------------------------------------------------- doctor: Hunter, and Google's new key format
+def test_doctor_online_shows_the_hunter_credit_balance(isolated):
+    env = {"ANTHROPIC_API_KEY": "sk-ant-x", "SPREADSHEET_ID": "SHEET123", "HUNTER_API_KEY": "hk"}
+    h = Harness(isolated, env=env, creds=object(), backend=Rich({}, credits(42, plan="Free")))
+    assert h.run("doctor", "--online") == 0
+    assert "[ ok ] Hunter key and credits" in h.text and "plan Free: 42 of 50 credits left, resets 2026-11-19" in h.text
+
+
+def test_doctor_online_reports_a_rejected_hunter_key(isolated):
+    env = {"ANTHROPIC_API_KEY": "sk-ant-x", "SPREADSHEET_ID": "SHEET123", "HUNTER_API_KEY": "hk"}
+    h = Harness(isolated, env=env, creds=object(), backend=Rich({}, DiscoveryAuthError("Hunter rejected HUNTER_API_KEY")))
+    assert h.run("doctor", "--online") == 1 and "[FAIL] Hunter key and credits" in h.text and "Hunter rejected HUNTER_API_KEY" in h.text
+
+
+def test_doctor_online_accepts_a_hunter_reply_without_a_balance_and_skips_it_without_a_key(isolated):
+    env = {"ANTHROPIC_API_KEY": "sk-ant-x", "SPREADSHEET_ID": "SHEET123"}
+    keyless = Harness(isolated, env=env, creds=object(), backend=Rich({}, credits(1)))
+    keyless.run("doctor", "--online")
+    assert "Hunter key and credits" not in keyless.text and keyless.rt._backend.balance_calls == 0
+    odd = Harness(isolated, env={**env, "HUNTER_API_KEY": "hk"}, creds=object(), backend=Rich({}, None))
+    assert odd.run("doctor", "--online") == 0 and "credit balance was not in the reply" in odd.text
+
+
+@pytest.mark.parametrize("key,warned", [("AQ.fake-gemini-key-1", False), ("AIzaFakeGeminiKey1", False), ("not-a-google-key", True)])
+def test_configure_recognises_both_google_key_formats(isolated, monkeypatch, key, warned):
+    good_check(monkeypatch)
+    h = Harness(isolated, env={}, read_stdin=lambda: key)
+    assert h.run("configure", "--provider", "gemini", "--key-from-stdin") == 0
+    assert ("normally start with AIza or AQ." in h.text) is warned
+
+
+def test_try_draft_points_to_the_next_unfinished_setup_step(tmp_path, monkeypatch):
+    from tests.samples import GOOD_MODEL_TEXT
+    fresh, _ = offline_harness(tmp_path, GOOD_MODEL_TEXT)
+    assert fresh.run("try-draft") == 0 and "Next: python main.py auth" in fresh.text
+
+    token = tmp_path / "token-present.json"
+    token.write_text("{}")
+    monkeypatch.setattr(C, "TOKEN_FILE", token)
+    signed_in, _ = offline_harness(tmp_path, GOOD_MODEL_TEXT)
+    assert signed_in.run("try-draft") == 0 and "Next: python main.py init-sheet" in signed_in.text
+
+    ready = Harness(tmp_path, env={"SPREADSHEET_ID": "S1"}, llm=FakeLLM(GOOD_MODEL_TEXT), sheet=Untouchable(), gmail=Untouchable(), creds=Untouchable())
+    assert ready.run("try-draft") == 0 and "Next: python main.py status" in ready.text

@@ -15,7 +15,7 @@ find leads  ->  model drafts  ->  you review and approve in the Sheet  ->  Gmail
 > `.gitignore` and a pre-commit hook block the common mistakes (see [Safety](#safety)).
 
 ## Contents
-[Quick start](#quick-start) · [Setup](#setup-step-by-step) · [Daily use](#daily-use) · [The sheet](#the-review-sheet) ·
+[Quick start](#quick-start) · [Setup](#setup-step-by-step) · [Daily cheat sheet](#daily-cheat-sheet) · [Try it safely](#try-it-safely-first) · [Daily use](#daily-use) · [The sheet](#the-review-sheet) ·
 [Commands](#commands) · [Safety](#safety) · [How drafting works](#how-drafting-works) · [How sending works](#how-sending-works) ·
 [Finding leads](#finding-leads) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
@@ -30,11 +30,15 @@ git config core.hooksPath scripts/hooks          # turn on the secrets guard
 
 source .venv/bin/activate                         # from here on, plain `python` is the project's Python
 python main.py doctor                             # shows exactly what is still missing
-python main.py configure                          # step 1: model API key
+python main.py configure                          # step 1: model API key (Claude or Gemini)
+python main.py try-draft                          # see one real sample email (no Google login needed)
 # step 2: Google Cloud setup (below), then:
 python main.py auth                               # sign in as pennstatemcvb@gmail.com
 python main.py init-sheet                         # create the review sheet
-python main.py import --csv data/targets.csv      # or: discover   (add contacts)
+cp data/targets.example.csv data/targets.csv      # YOUR brand list: edit it (it is gitignored)
+python main.py discover --dry-run                 # preview which brands would be looked up (free)
+python main.py discover --limit 10                # find contacts at 10 of them (uses Hunter credits)
+#   with contacts you already have instead:  python main.py import --csv data/my_contacts.csv
 python main.py draft                              # the model writes emails
 #   -> open the sheet, edit anything, set Approval Status to Approved
 python main.py send                               # creates Gmail drafts. You press Send in Gmail
@@ -42,6 +46,55 @@ python main.py sync                               # marks the ones you sent
 ```
 
 `python main.py doctor --online` tests every key and login without sending anything.
+
+## Daily cheat sheet
+
+**Nothing in this project runs by itself.** Every step is a command you type, and you are the approval step. Open a
+terminal once per session:
+
+```bash
+cd ~/Documents/code/operation_sponsorships && source .venv/bin/activate
+```
+
+| How often | Command | What it does | What it uses |
+|---|---|---|---|
+| any time | `python main.py status` | counts by stage, what is waiting on you, the next command to run | nothing |
+| weekly | `python main.py discover --limit 10` | finds contacts at 10 brands from `data/targets.csv` and adds them as `Pending` rows | Hunter credits (usually 1 per brand, at most 2) |
+| each work day | `python main.py draft --limit 10` | writes emails for `Pending` rows | model tokens |
+| each work day | *(in the Google Sheet)* | read, edit, set `Approval Status` to `Approved` or `Rejected` | nothing |
+| each work day | `python main.py send --preview` | shows exactly what would be created and changes nothing | nothing |
+| each work day | `python main.py send` | creates a Gmail draft for each `Approved` row. Open Gmail Drafts and press Send | nothing |
+| each work day | `python main.py sync` | marks rows `Sent` once you have sent their drafts | nothing |
+
+Now and then:
+
+| Command | When |
+|---|---|
+| `python main.py doctor --online` | to check every key and login still works (also shows your Hunter credits) |
+| `python main.py import --csv PATH` | you already have contacts with email addresses |
+| `python main.py try-draft --company "Nuun" --category Hydration` | to see how the model writes for a particular brand |
+| `python main.py send --live` | only when you decide to let it send for real (asks you to type `SEND`) |
+
+A sensible rhythm: find leads once a week, then draft, review and send a handful each work day. A brand-new Gmail sender
+does better with a small steady volume than with a burst, so treat 15 per run as a ceiling.
+
+## Try it safely first
+
+Each step is safe on its own and none of them sends an email. Stop at any step you are not happy with.
+
+1. `python main.py doctor --online` checks the model key, the Google login, the club Gmail account and the sheet.
+2. `python main.py try-draft` writes one real sample email. Nothing is saved or sent and no Google login is needed.
+   Add `--show-prompt` to see exactly what the model is sent.
+3. `python main.py discover --dry-run` lists the brands it would look up and your Hunter balance. It spends nothing.
+4. `python main.py discover --limit 2 --no-broad` is the first real lookup: at most 2 Hunter credits. Open the sheet
+   and look at the rows it added.
+5. `python main.py draft --limit 2` writes their emails into the sheet. Read them there.
+6. A test row that only goes to you: add a row by hand in the sheet with a made-up company, a category, and **your own
+   email address** as `Target Email` (an alias like `you+test1@gmail.com` works and lets you repeat the test). Run
+   `draft`, set that row to `Approved`, run `send`, open Gmail Drafts as the club account, press Send, and check it arrives.
+   Then `sync`.
+
+Only after step 6 look at real brands' emails and approve them.
 
 ## Setup, step by step
 
@@ -60,9 +113,15 @@ macOS ships Python 3.9, but every current dependency needs 3.10+. This project u
 Run `python main.py configure`. The key is typed hidden and saved to `.env` (gitignored, owner-only permissions), then
 tested. To pipe it in instead: `pbpaste | python main.py configure --key-from-stdin`.
 
-Cost is small but not zero: expect a few cents per email on the default Claude Opus model, so well under a dollar for a
-batch of 15. `draft` prints the real token counts so you can see it. For cheaper drafts set
-`ANTHROPIC_MODEL=claude-sonnet-5-5` in `.env`, or use Gemini.
+Then `python main.py try-draft` writes one real sample email with that key (nothing saved, nothing sent, no Google login
+needed). Gemini keys start with `AIza` or `AQ.`.
+
+**Privacy.** The model is sent only the company name, its category, and your optional note, never a contact's name or
+email address (`python main.py try-draft --show-prompt` prints the exact text). On Gemini's free tier Google says it may use
+prompts to improve its products, and does not for a paid-tier key. Claude is not used that way by default.
+
+Cost: Gemini's free tier costs nothing. On Claude expect a few cents per email with the default Opus model, so well under a
+dollar for a batch of 15; `ANTHROPIC_MODEL=claude-sonnet-5-5` in `.env` is cheaper. `draft` prints the real token counts.
 
 ### 3. Google Cloud: one login for Sheets, Drive and Gmail
 
@@ -125,6 +184,8 @@ Only needed for `discover`; `import` works without them. See [Finding leads](#fi
 
 ## Daily use
 
+The same steps as the cheat sheet above, with the detail.
+
 1. **Add leads.** `python main.py import --csv data/targets.csv` (contacts you already have) or
    `python main.py discover` (finds contacts at the brands you list).
 2. **Draft.** `python main.py draft`. Each Pending row gets a subject and body, and `Approval Status` becomes
@@ -174,13 +235,14 @@ How the sheet protects you:
 | `auth` | Sign in to Google as the club account. |
 | `init-sheet` | Create the review sheet. `--repair` re-adds missing columns and dropdowns. `--share EMAIL` gives someone edit access. |
 | `import --csv PATH` / `--sheet URL [--tab NAME]` | Add contacts that already have emails. Duplicates are skipped by address. |
-| `discover [--dry-run]` | Find contacts at brands with Hunter or Apollo, then add them. `--limit`, `--per-domain`, `--backend`, `--min-confidence`. |
+| `discover [--dry-run]` | Find contacts at the brands in your list with Hunter or Apollo, then add them. `--limit N` brands per run, `--no-broad` (1 credit per brand at most), `--per-domain`, `--backend`, `--min-confidence`, `--max-reveals` (Apollo), `--recheck-days N`. |
+| `try-draft [--company X] [--category Y] [--hook "..."] [--show-prompt]` | One sample email with the real model. Needs only the model key: no Google login, nothing saved or sent. |
 | `draft [--dry-run] [--limit N] [--row ID]` | Write emails for `Pending` rows. `--dry-run` prints them without touching the sheet. |
 | `send [--preview] [--limit N]` | Create Gmail drafts for `Approved` + `Unsent` rows. `--preview` changes nothing. |
 | `send --live [--yes]` | Really send, with pauses. Asks you to type `SEND` unless `--yes`. |
 | `sync` | Mark `Drafted` rows `Sent` once their draft has left Gmail Drafts. |
 | `status` | Counts by stage, what is waiting on you, and what to run next. |
-| `doctor [--online]` | Checks the setup and says exactly what is missing. `--online` tests keys and logins. |
+| `doctor [--online]` | Checks the setup and says exactly what is missing. `--online` tests the keys and logins and shows your Hunter credits. |
 
 Exit codes: `0` fine, `1` something needs attention (the message says what), `2` unexpected error (details in
 `logs/outreach.log`), `130` stopped with Ctrl+C. `-v` shows detailed logs.
@@ -197,7 +259,7 @@ Exit codes: `0` fine, `1` something needs attention (the message says what), `2`
   like an API key or token. Turn it on once per clone: `git config core.hooksPath scripts/hooks`. `doctor` warns if it is off.
 - **Secrets stay local.** `.env` and `config/token.json` are written with owner-only permissions. Keys are never printed
   in full, never put in a URL, and never sent to any service except the one they belong to.
-- **Privacy.** The model sees the company name, category, and your optional note. It never sees contact names or emails.
+- **Privacy.** The model sees the company name, category, and your optional note. It never sees contact names or emails. On Gemini's free tier Google says it may use prompts to improve its products (see step 2 of Setup).
 
 ## How drafting works
 
@@ -255,7 +317,17 @@ opt-out line.
 
 ## Finding leads
 
-Three ways, all ending as new `Pending` rows (duplicates by email are skipped):
+**Who fills in `data/targets.csv`? You do.** It is a short list of brands you want to approach, three columns:
+`Company Name, Domain, Category` (Category is Energy, Skincare, Hydration, Recovery, or Gear). Copy
+`data/targets.example.csv`, which already has 20 brands, and add or delete rows in Excel, Numbers, Google Sheets (download as
+CSV), or any text editor. Good places to find more brands: ask the roster what they actually use, and look at who sponsors
+other college and club teams.
+
+`discover` does **not** find new brands. It finds the *people* (marketing and partnerships contacts) at the brands you list,
+using Hunter or Apollo, and adds them to the review sheet as `Pending`. The file is only read when you run a command, so
+nothing happens until you do.
+
+Three ways to get leads in, all ending as new `Pending` rows (duplicates by email are skipped):
 
 1. **A CSV you write.** Copy `data/targets.example.csv` to `data/targets.csv` (it is gitignored, so lead data never reaches
    GitHub). With a `Target Email` column, `import` adds those contacts directly.
@@ -279,9 +351,14 @@ enrichment routes enabled), then `APOLLO_API_KEY=` and
 `DISCOVERY_BACKEND=apollo`. Searching is free but returns no emails; each revealed email costs about 1 credit, so only the
 best few per brand are revealed and `--max-reveals` caps a run (default 20).
 
-Always try `python main.py discover --dry-run` first: it lists what would be looked up and spends nothing. Brands already in
-the sheet are skipped, so re-running never pays twice. If the plan runs out mid-run, what was found is kept. Check each
-address before approving: public-data tools can be out of date.
+Always try `python main.py discover --dry-run` first: it lists what would be looked up and spends nothing. Before a real run
+it also shows your actual Hunter balance (that account call is free), for example
+`Your Hunter plan (Free): 50 of 50 credits left, resetting 2026-11-19.`, and it stops by itself when the credits run out.
+
+Two things stop it paying twice. Brands already in the sheet are skipped. A brand that was searched but had no usable
+contact (only VPs, generic inboxes, or nobody at all) is remembered in `data/lookups.json` (gitignored) and left alone for
+30 days; `--recheck-days 0` searches everything again, and deleting that file does the same. If the plan runs out mid-run,
+what was found is kept. Check each address before approving: public-data tools can be out of date.
 
 ## Troubleshooting
 

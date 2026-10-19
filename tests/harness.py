@@ -24,8 +24,9 @@ class Harness:
         self.gmail = FakeGmail()
         self.llm = FakeLLM(GOOD_MODEL_TEXT)
         self.env_path = tmp_path / ".env"
+        self.lookups_path = tmp_path / "lookups.json"
         self.settings = Settings.load(env=env if env is not None else {"SPREADSHEET_ID": "SHEET123"})
-        kwargs = dict(out=self.lines.append, interactive=False, today=date(2026, 10, 18), env_path=self.env_path,
+        kwargs = dict(out=self.lines.append, interactive=False, today=date(2026, 10, 18), env_path=self.env_path, lookups_path=tmp_path / "lookups.json",
                       sheet=self.sheet, gmail=self.gmail, llm=self.llm, sleep=self.sleeps.append, clock=lambda: NOW)
         kwargs.update(runtime_kwargs)
         self.rt = Runtime(self.settings, **kwargs)

@@ -278,3 +278,47 @@ def test_a_row_deleted_while_drafting_is_skipped_cleanly():
     llm.generate = generate_then_delete
     report = drafter.run(limit=1)
     assert report.outcomes[0].status == "skipped" and not report.drafted
+
+
+# --------------------------------------------------------------------------- preview (no sheet needed)
+def preview_row(**over):
+    cells = {Col.ROW_ID: "PREVIEW", Col.COMPANY: "CeraVe", Col.CATEGORY: "Skincare", Col.TARGET_NAME: "Jane Doe",
+             Col.TARGET_EMAIL: "preview@example.com"}
+    cells.update(over)
+    return LeadRow(cells)
+
+
+def preview_drafter(*script):
+    return D.Drafter(Settings.load(env={}), None, FakeLLM(*script), today=TODAY)
+
+
+def test_preview_drafts_one_email_without_any_sheet():
+    drafter = preview_drafter(GOOD_MODEL_TEXT)
+    outcome, report = drafter.preview(preview_row())
+    assert outcome.status == "preview" and outcome.subject == GOOD_SUBJECT and outcome.attempts == 1
+    assert outcome.email.startswith("Hi Jane,") and "@varunkaveti" in outcome.email
+    assert (report.input_tokens, report.output_tokens) == (100, 200)
+
+
+def test_preview_keeps_the_broken_rules_and_the_models_last_reply():
+    bad = model_text(body="Short and wrong. Celsius is great.")
+    outcome, _ = preview_drafter(bad).preview(preview_row())
+    assert outcome.status == "failed" and outcome.attempts == 2
+    assert any("Celsius" in p for p in outcome.problems) and any("required sentence" in p for p in outcome.problems)
+    assert "Short and wrong." in outcome.raw
+
+
+def test_preview_skips_a_banned_company_without_calling_the_model():
+    drafter = preview_drafter(GOOD_MODEL_TEXT)
+    outcome, _ = drafter.preview(preview_row(**{Col.COMPANY: "Celsius"}))
+    assert outcome.status == "skipped" and "BANNED_BRANDS" in outcome.reason and not drafter.llm.calls
+
+
+def test_preview_lets_a_rejected_key_through_so_the_cli_can_say_so():
+    with pytest.raises(LLMAuthError):
+        preview_drafter(LLMAuthError("bad key")).preview(preview_row())
+
+
+def test_preview_reports_a_refusal_as_a_failure_without_rules():
+    outcome, _ = preview_drafter(LLMRefusal("declined")).preview(preview_row())
+    assert outcome.status == "failed" and outcome.problems == () and "declined" in outcome.reason

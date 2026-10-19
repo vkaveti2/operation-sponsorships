@@ -1,4 +1,5 @@
 import json
+from datetime import date
 
 import pytest
 import requests
@@ -446,3 +447,137 @@ def test_discovered_leads_flow_into_the_sheet_without_duplicates():
     assert again.added_ids == [] and len(again.duplicates) == 2
     rows = sheet.read_rows()
     assert rows[0].notes == "[found] Stub: x" and rows[0].approval == "Pending" and rows[1].category == "Gears"
+
+
+# --------------------------------------------------------------------------- remembering dead ends
+def test_the_lookup_log_survives_a_restart_and_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "data" / "lookups.json"
+    log = D.LookupLog(path)
+    assert not path.exists() and not log.damaged and log.entries == {}
+    log.record("cerave.com", "CeraVe", date(2026, 10, 18))
+    log.save()
+    assert D.LookupLog(path).entries == {"cerave.com": {"company": "CeraVe", "date": "2026-10-18"}}
+    assert sorted(p.name for p in path.parent.iterdir()) == ["lookups.json"]
+    assert json.loads(path.read_text())["version"] == 1
+
+
+def test_a_log_with_nothing_new_writes_nothing(tmp_path):
+    path = tmp_path / "lookups.json"
+    D.LookupLog(path).save()
+    assert not path.exists()
+    D.LookupLog(None).save()  # no path at all is fine too
+
+
+def test_forgetting_a_brand_removes_it_from_the_file(tmp_path):
+    path = tmp_path / "lookups.json"
+    log = D.LookupLog(path)
+    log.record("a.com", "A", date(2026, 10, 18))
+    log.record("b.com", "B", date(2026, 10, 18))
+    log.save()
+    log.forget("a.com")
+    log.forget("never-there.com")
+    log.save()
+    assert list(D.LookupLog(path).entries) == ["b.com"]
+
+
+@pytest.mark.parametrize("days_later,remembered", [(0, True), (1, True), (29, True), (30, False), (31, False), (400, False)])
+def test_a_dead_end_is_remembered_for_exactly_the_recheck_window(days_later, remembered):
+    log = D.LookupLog(None)
+    log.record("cerave.com", "CeraVe", date(2026, 10, 18))
+    today = date.fromordinal(date(2026, 10, 18).toordinal() + days_later)
+    reason = log.skip_reason("cerave.com", today, 30)
+    assert bool(reason) is remembered
+    if remembered:
+        assert "searched on 2026-10-18" in reason and "searched again on 2026-11-17" in reason and "--recheck-days 0" in reason
+
+
+def test_recheck_zero_a_new_brand_and_a_clock_that_moved_backwards_never_block_a_search():
+    log = D.LookupLog(None)
+    log.record("cerave.com", "CeraVe", date(2026, 10, 18))
+    assert log.skip_reason("cerave.com", date(2026, 10, 18), 0) == ""
+    assert log.skip_reason("other.com", date(2026, 10, 18), 30) == ""
+    assert log.skip_reason("cerave.com", date(2026, 9, 1), 30) == ""  # the saved date is in the future: do not trust it
+
+
+@pytest.mark.parametrize("content", [
+    "{ not json", "[]", '{"dead_ends": []}', '{"dead_ends": {"a.com": {"date": "last tuesday"}}}',
+    '{"dead_ends": {"a.com": {}}}', '{"other": 1}', "",
+])
+def test_a_damaged_log_starts_over_instead_of_failing(tmp_path, content):
+    path = tmp_path / "lookups.json"
+    path.write_text(content)
+    log = D.LookupLog(path)
+    assert log.damaged and log.entries == {}
+    log.record("a.com", "A", date(2026, 10, 18))
+    log.save()
+    assert not log.damaged and D.LookupLog(path).entries["a.com"]["date"] == "2026-10-18"
+
+
+def test_remembered_brands_are_skipped_before_the_limit_is_counted():
+    remembered = {"b.com": "searched on 2026-10-10 with no usable contact"}
+    todo, skipped, left = D.plan_lookups([T("A"), T("B"), T("C"), T("D")], remembered=remembered, limit=2)
+    assert [t.company for t in todo] == ["A", "C"] and left == 1  # B did not use up one of the two slots
+    assert skipped == [("B", "searched on 2026-10-10 with no usable contact")]
+
+
+def test_discover_reports_which_brands_found_people_and_which_were_dead_ends():
+    backend = StubBackend({"A": found("jo@a.com"), "B": D.LookupResult(searches=2), "C": DiscoveryError("C broke"),
+                           "D": found("al@d.com")})
+    report = D.discover([T("A"), T("B"), T("C"), T("D")], backend)
+    assert report.found_keys == ["a.com", "d.com"] and report.dead_end_keys == ["b.com"]  # an error is not a dead end
+
+
+def test_a_quota_stop_is_not_recorded_as_a_dead_end():
+    backend = StubBackend({"A": D.LookupResult(searches=1, stop="plan used up")})
+    report = D.discover([T("A"), T("B")], backend)
+    assert report.dead_end_keys == [] and report.found_keys == [] and report.aborted == "plan used up"
+
+
+# --------------------------------------------------------------------------- Hunter credit balance
+def account_body(**requests_blocks):
+    return {"data": {"first_name": "Varun", "plan_name": "Free", "plan_level": 0, "reset_date": "2026-11-19", "requests": requests_blocks}}
+
+
+CREDITS = {"used": 0, "available": 50.0, "remaining": 50.0}
+
+
+def test_hunter_balance_reads_the_free_account_endpoint_with_the_key_in_a_header():
+    session = Session(Resp(200, account_body(credits=CREDITS, searches={"used": 0, "available": 50, "remaining": 50})))
+    balance = D.HunterBackend("SECRET-KEY", session=session, **NO_SLEEP).balance()
+    assert balance == D.Balance("Free", 50.0, 50.0, "2026-11-19")
+    kind, url, kw = session.calls[0]
+    assert (kind, url) == ("GET", "https://api.hunter.io/v2/account") and kw["headers"]["X-API-KEY"] == "SECRET-KEY"
+    assert "SECRET-KEY" not in json.dumps(kw["params"])
+
+
+def test_hunter_balance_prefers_the_credits_pool_and_falls_back_to_searches():
+    both = Session(Resp(200, account_body(credits={"remaining": 12.5, "available": 50}, searches={"remaining": 99, "available": 99})))
+    assert D.HunterBackend("k", session=both, **NO_SLEEP).balance().remaining == 12.5
+    only_searches = Session(Resp(200, account_body(searches={"remaining": 7, "available": 25}, verifications={"remaining": 3, "available": 100})))
+    assert D.HunterBackend("k", session=only_searches, **NO_SLEEP).balance() == D.Balance("Free", 7.0, 25.0, "2026-11-19")
+
+
+def test_hunter_balance_copes_with_a_missing_available_figure_and_a_missing_plan():
+    body = {"data": {"requests": {"credits": {"remaining": 3.5}}}}
+    assert D.HunterBackend("k", session=Session(Resp(200, body)), **NO_SLEEP).balance() == D.Balance("", 3.5, 3.5, "")
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"data": None}, {"data": []}, {"data": {}}, {"data": {"requests": []}}, {"data": {"requests": {}}},
+    {"data": {"requests": {"credits": "lots"}}}, {"data": {"requests": {"credits": {"remaining": "lots"}}}},
+    {"data": {"requests": {"credits": {"remaining": None}, "searches": {"remaining": float("nan")}}}},
+    {"data": {"requests": {"credits": {"remaining": float("inf")}}}},
+])
+def test_hunter_balance_is_none_for_a_reply_in_an_unexpected_shape(body):
+    assert D.HunterBackend("k", session=Session(Resp(200, body)), **NO_SLEEP).balance() is None
+
+
+def test_hunter_balance_reports_a_rejected_key():
+    with pytest.raises(DiscoveryAuthError, match="HUNTER_API_KEY"):
+        D.HunterBackend("bad", session=Session(Resp(401, {"errors": [{"id": "authentication_failed"}]})), **NO_SLEEP).balance()
+
+
+def test_number_parsing_ignores_junk():
+    assert D._number("12.5") == 12.5 and D._number(3) == 3.0
+    for junk in (None, "x", [], {}, float("nan"), float("inf")):
+        assert D._number(junk) is None
