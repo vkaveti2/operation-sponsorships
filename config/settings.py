@@ -146,7 +146,7 @@ def season_context(today: date) -> Season:
         )
     return Season(
         "offseason",
-        "we are coming off our spring season and already planning for the next one",
+        "we are coming off our spring season and already planning for next season",
     )
 
 

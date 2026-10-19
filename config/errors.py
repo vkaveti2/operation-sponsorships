@@ -27,7 +27,7 @@ class LLMError(OutreachError):
 
 
 class LLMAuthError(LLMError):
-    """The LLM API key is missing or rejected. Retrying cannot help."""
+    """A setup problem retrying cannot fix: bad key, unknown model name, or no credit left."""
 
 
 class LLMTransientError(LLMError):

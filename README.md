@@ -22,12 +22,12 @@ discover leads -> LLM drafts -> you review in the Sheet -> Gmail drafts (default
 | Secret-blocking pre-commit hook | done, tested |
 | Google OAuth loader (`config/credentials.py`) | done, tested (one login covers Sheets, Drive and Gmail) |
 | Sheet manager (`src/sheet_manager.py`) | done, tested (dropdowns, colors, Row ID lookup, edit-conflict guard, retries) |
-| LLM drafter + guardrails (`src/drafter.py`) | next |
-| Mailer: drafts and rate-limited send (`src/mailer.py`) | planned |
+| LLM layer (`src/llm.py`, Claude or Gemini), guardrails, drafter (`src/drafter.py`) | done, tested |
+| Mailer: drafts and rate-limited send (`src/mailer.py`) | next |
 | Lead discovery: Hunter / Apollo / CSV (`src/discovery.py`) | planned |
 | CLI (`main.py`) and tests | planned |
 
-This table is updated with every commit. 76 automated tests run offline with `.venv/bin/python -m pytest`.
+This table is updated with every commit. 211 automated tests run offline with `.venv/bin/python -m pytest`.
 
 ## Setup (what works today)
 
@@ -85,6 +85,37 @@ It refuses to save unless you signed in as pennstatemcvb@gmail.com and granted e
 If the Google Cloud consent screen is left in "Testing", Google expires the login every 7 days; the README setup section
 will cover publishing the app to avoid that.
 
+## How drafting works
+
+`python main.py draft` (CLI coming) takes every row that is `Pending` + `Unsent` and has a valid email.
+
+1. The model gets the company, its category, and your optional `Custom Hook / Angle`. It never sees the contact's name or email.
+2. The model writes only the subject and the middle of the email. Code adds the greeting, the opt-out line, the sign-off
+   and the signature (name, title, email, both Instagram handles), so those can never drift or be misspelled.
+3. Deterministic checks run on the result. A draft must: contain the required "partnered with brands in the past"
+   sentence word for word, say top 10 / NCVF / 30 athletes, mention the campus groups and the season, make a clear ask,
+   stay at 90 to 170 words, and avoid banned brands, dashes, semicolons, exclamation marks, emoji, markdown,
+   placeholders, stock phrases, and any number except 10 and 30.
+4. Easy problems are repaired automatically (long dashes become commas, a stray greeting or sign-off is trimmed).
+   Anything else goes back to the model once with the exact list of problems.
+5. A draft that still fails is **not** written. The row stays `Pending` and the reason goes in `Notes`.
+6. A good draft is written with `Approval Status = Pending Approval`. Nothing is sent until you set `Approved`.
+
+Rows are skipped, with a note, when there is no valid email, the company is on `BANNED_BRANDS`, or the row already has
+draft text (clear the subject and body cells to have it rewritten). If you edit a row while a draft is being written,
+your edit wins and the draft is dropped.
+
+Pick the model with `LLM_PROVIDER` in `.env`:
+
+| Provider | Default model | Notes |
+|---|---|---|
+| `anthropic` | `claude-opus-5-5` | Claude. `ANTHROPIC_MODEL=claude-sonnet-5-5` is cheaper. Refusal fallback is on by default. |
+| `gemini` | `gemini-3.8-flash` | Google Gemini. Confirm the name with `python main.py doctor`. |
+
+Season wording follows the calendar. August to September says we are in the middle of the fall slate, October to
+December says we are wrapping it up and gearing up for spring, January to April says we are in the spring run with
+regionals and nationals ahead, and May to July says we are planning for next season.
+
 ## Pitch rules the drafter must follow
 
 - Never name brands we already work with. The line is exactly: *"We have partnered with brands in the past and are
@@ -99,7 +130,7 @@ will cover publishing the app to avoid that.
 
 ```
 config/    settings, error types, logging, Google OAuth loader, Google error messages
-src/       models, sheet_manager (done); drafter, mailer, discovery (coming)
+src/       models, sheet_manager, llm, guardrails, drafter (done); mailer, discovery (coming)
 scripts/   hooks/pre-commit
 data/      targets.example.csv (your real lead CSVs stay local and gitignored)
 tests/     pytest, no network
