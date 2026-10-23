@@ -29,8 +29,8 @@ def cell(ws, row, column):
 # --------------------------------------------------------------------------- prompts
 def test_system_prompt_carries_every_rule_and_never_names_a_brand():
     prompt = D.build_system_prompt(Sender(), season_context(TODAY))
-    for must in ("top 10", "NCVF", "30 athletes", "fraternities", "cultural associations", "honors college",
-                 "wrapping up our fall tournament slate", "We have partnered with brands in the past"):
+    for must in ("top 10", "NCVF", "not NCAA", "30 athletes", "fraternities", "cultural associations", "honors college",
+                 "We have worked with brands before", "genuinely using it"):
         assert must in prompt
     assert "Celsius" not in prompt and "Red Bull" not in prompt
     assert "Varun Kaveti" in prompt and "SUBJECT:" in prompt

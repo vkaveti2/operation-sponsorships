@@ -44,6 +44,7 @@ FLUFF_PHRASES = (
     "pleasure to meet", "i came across", "to whom it may concern", "dear sir", "valued partner",
     "win-win", "next level", "fast-paced", "rest assured", "don't hesitate", "do not hesitate",
     "at your earliest convenience", "per my last", "moving forward", "reach new heights",
+    "i am excited to", "i'm excited to", "i would love to", "i'd love to",
     "unsubscribe", "opt out", "opt-out",
 )
 
@@ -212,8 +213,8 @@ def check_draft(
     first, second, label = _SEASON_RULES.get(season_key, _SEASON_RULES["late_fall"])
     if not re.search(first, flat, re.I) or (second and not re.search(second, flat, re.I)):
         problems.append(f"Frame the season as instructed (mention {label}).")
-    if not re.search(r"sponsor|sample|seed", flat, re.I):
-        problems.append("State the ask: a product sponsorship and/or sample seeding.")
+    if not re.search(r"sponsor|sample|seed|partner|collaborat", flat, re.I):
+        problems.append("The closing must ask about or mention sponsorship, samples, partnership, or collaboration.")
 
     # --- length
     words = word_count(body)

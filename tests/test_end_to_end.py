@@ -76,7 +76,7 @@ def test_the_full_workflow(tmp_path, csv_file):
     assert msg["Subject"] == "A subject Varun wrote himself" and msg["From"] == "Varun Kaveti <pennstatemcvb@gmail.com>"
     body = msg.get_content()
     assert body.startswith("Hi Jane,") and "@psumensclubvolleyball" in body and body.rstrip().endswith("Personal Instagram: @varunkaveti")
-    assert "We have partnered with brands in the past and are always excited to showcase and actively promote products our athletes love." in body
+    assert "We have worked with brands before and it has always been pretty informal, just getting product in the hands of athletes who are genuinely using it." in body
     states = {r.company: (r.approval, r.send_status) for r in h.sheet.read_rows()}
     assert states == {"CeraVe": ("Approved", "Drafted"), "Liquid I.V.": ("Approved", "Drafted"), "Red Bull": ("Rejected", "Unsent")}
 

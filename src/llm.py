@@ -6,6 +6,8 @@ config.errors, so switching providers is a one-word change in .env.
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -247,3 +249,93 @@ def build_llm(settings: Settings, *, client: Any = None) -> LLMClient:
         return AnthropicLLM(key, settings.anthropic_model, refusal_fallback=settings.anthropic_refusal_fallback,
                             client=client)
     return GeminiLLM(key, settings.gemini_model, client=client)
+
+
+# --------------------------------------------------------------------------- manual / clipboard
+_SEPARATOR = "-" * 72
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Copy *text* to the macOS clipboard via pbcopy. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["pbcopy"], input=text.encode(), check=False, capture_output=True
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _read_multiline(prompt_header: str) -> str:
+    """Read until the user enters a blank line or EOF, returning all lines joined."""
+    print(prompt_header, flush=True)
+    lines: list[str] = []
+    try:
+        while True:
+            line = input()
+            if line.strip() == "" and lines:
+                break
+            lines.append(line)
+    except EOFError:
+        pass
+    return "\n".join(lines).strip()
+
+
+class ManualLLM(LLMClient):
+    """Clipboard-assisted manual provider.
+
+    generate() assembles the full prompt (system + user), copies it to the macOS
+    clipboard, waits for the user to paste Gemini's reply back, and returns it as
+    an LLMResult.  Token counts are estimated from character length.
+    """
+
+    provider = "manual"
+    model = "gemini-web"
+
+    def generate(self, system: str, prompt: str) -> LLMResult:
+        full_prompt = (
+            "SYSTEM INSTRUCTIONS:\n"
+            + _SEPARATOR + "\n"
+            + system.strip()
+            + "\n" + _SEPARATOR + "\n\n"
+            + "USER REQUEST:\n"
+            + _SEPARATOR + "\n"
+            + prompt.strip()
+            + "\n" + _SEPARATOR
+        )
+
+        copied = _copy_to_clipboard(full_prompt)
+        print("\n" + "=" * 72, flush=True)
+        print("MANUAL MODE — prompt for Gemini ready", flush=True)
+        if copied:
+            print("✓  Prompt copied to clipboard. Paste it into Gemini, run it, then", flush=True)
+            print("   copy Gemini's full reply.", flush=True)
+        else:
+            print("  (pbcopy not available — copy the prompt below manually)", flush=True)
+            print(_SEPARATOR, flush=True)
+            print(full_prompt, flush=True)
+            print(_SEPARATOR, flush=True)
+        print("=" * 72 + "\n", flush=True)
+
+        text = _read_multiline(
+            "Paste Gemini's reply here, then press Enter on a blank line to continue:\n"
+        )
+
+        if not text:
+            raise LLMError("No reply was pasted. Run the command again and paste Gemini's output.")
+
+        # Rough token estimates (1 token ≈ 4 chars)
+        return LLMResult(
+            text=text,
+            provider=self.provider,
+            model=self.model,
+            input_tokens=len(full_prompt) // 4,
+            output_tokens=len(text) // 4,
+        )
+
+    def check(self) -> str:
+        return "Manual mode active — no API key required, prompts go to Gemini Web"
+
+
+def build_manual_llm() -> ManualLLM:
+    return ManualLLM()

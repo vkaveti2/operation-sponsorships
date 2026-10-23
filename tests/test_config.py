@@ -92,8 +92,8 @@ def test_october_uses_the_requested_framing():
 
 def test_required_line_is_exact():
     assert REQUIRED_PARTNER_LINE == (
-        "We have partnered with brands in the past and are always excited to showcase "
-        "and actively promote products our athletes love."
+        "We have worked with brands before and it has always been pretty informal, "
+        "just getting product in the hands of athletes who are genuinely using it."
     )
 
 

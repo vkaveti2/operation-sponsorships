@@ -25,16 +25,16 @@ def sub(old, new, text=GOOD_BODY):
     return text.replace(old, new)
 
 
-REQ_LINE = "We have partnered with brands in the past and are always excited to showcase and actively promote products our athletes love."
+REQ_LINE = "We have worked with brands before and it has always been pretty informal, just getting product in the hands of athletes who are genuinely using it."
 RULE_CASES = [
     ("required line missing", sub(REQ_LINE, "We love brands."), "required sentence"),
-    ("required line reworded", sub("actively promote", "promote"), "required sentence"),
+    ("required line reworded", sub("genuinely using it", "using it"), "required sentence"),
     ("top 10 missing", sub("top 10 nationally ranked", "nationally ranked"), "top 10"),
     ("NCVF missing", sub("National Collegiate Volleyball Federation (NCVF)", "a national league"), "NCVF"),
     ("roster missing", sub("Our 30 athletes", "Our athletes"), "30 athletes"),
     ("campus reach missing", sub("in fraternities, cultural associations, the honors college, and other club sports teams", "around campus"), "campus reach"),
     ("season missing", sub("We are wrapping up our fall tournament slate and gearing up for our full spring competitive run. ", ""), "season"),
-    ("ask missing", sub("a product sponsorship or sending samples for the team to try", "your thoughts"), "ask"),
+    ("ask missing", GOOD_BODY.rsplit("\n\n", 1)[0] + "\n\nLet me know if you have any questions.", "ask"),
     ("banned brand", GOOD_BODY + " Celsius is great.", "Celsius"),
     ("banned brand other case", GOOD_BODY + " We love celsius.", "Celsius"),
     ("semicolon", sub("roster.", "roster; really."), "semicolons"),

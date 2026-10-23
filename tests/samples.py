@@ -12,10 +12,10 @@ GOOD_BODY = (
     "Penn State Men's Club Volleyball is a top 10 nationally ranked program in the National Collegiate "
     "Volleyball Federation (NCVF). Our 30 athletes are active across campus in fraternities, cultural "
     "associations, the honors college, and other club sports teams. We are wrapping up our fall tournament "
-    "slate and gearing up for our full spring competitive run. We have partnered with brands in the past and "
-    "are always excited to showcase and actively promote products our athletes love.\n\n"
-    "We would like to talk about a product sponsorship or sending samples for the team to try. Are you the "
-    "right person for this, or could you point me to who is?"
+    "slate and gearing up for our full spring competitive run. We have worked with brands before and it has "
+    "always been pretty informal, just getting product in the hands of athletes who are genuinely using it.\n\n"
+    "Do you work with college or club teams at all? If there is someone on your end who handles sponsorships "
+    "or partnerships, I am happy to reach out to them instead."
 )
 
 

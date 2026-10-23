@@ -94,8 +94,8 @@ TARGET_TITLES = [
 
 # --------------------------------------------------------------------------- pitch rules
 REQUIRED_PARTNER_LINE = (
-    "We have partnered with brands in the past and are always excited to showcase "
-    "and actively promote products our athletes love."
+    "We have worked with brands before and it has always been pretty informal, "
+    "just getting product in the hands of athletes who are genuinely using it."
 )
 OPT_OUT_LINE = "If you'd rather not hear from us, just reply and I won't follow up again."
 

@@ -37,7 +37,7 @@ from config.settings import (
 )
 from src import discovery as disc
 from src.drafter import DEFAULT_LIMIT, Drafter, build_system_prompt, build_user_prompt, pick_angle
-from src.llm import LLMClient, build_llm
+from src.llm import LLMClient, ManualLLM, build_llm, build_manual_llm
 from src.mailer import GmailApi, Mailer, count_sent_since, local_now
 from src.models import LeadRow, normalize_category
 from src.sheet_manager import DEFAULT_TITLE, SheetManager, same
@@ -120,7 +120,9 @@ class Runtime:
             self._gmail = GmailApi(AuthorizedSession(self.creds()))
         return self._gmail
 
-    def llm(self) -> LLMClient:
+    def llm(self, *, manual: bool = False) -> LLMClient:
+        if manual:
+            return build_manual_llm()
         if self._llm is None:
             self._llm = build_llm(self.settings)
         return self._llm
@@ -408,7 +410,8 @@ def cmd_discover(rt: Runtime, args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- draft
 def cmd_draft(rt: Runtime, args: argparse.Namespace) -> int:
-    drafter = Drafter(rt.settings, rt.sheet(), rt.llm(), today=rt.today)
+    manual = getattr(args, "manual", False)
+    drafter = Drafter(rt.settings, rt.sheet(), rt.llm(manual=manual), today=rt.today)
     report = drafter.run(limit=args.limit, row_ids=args.row or (), dry_run=args.dry_run)
     for outcome in report.previews:
         rt.say(f"\n--- preview for {outcome.label} ---\nSubject: {outcome.subject}\n\n{outcome.email}\n")
@@ -445,15 +448,20 @@ def _next_step_after_model_works(rt: Runtime) -> str:
 def cmd_try_draft(rt: Runtime, args: argparse.Namespace) -> int:
     """One sample email with the real model. Needs only the model key: no Google login, no sheet, nothing saved."""
     s = rt.settings
+    manual = getattr(args, "manual", False)
     company = (args.company or "").strip()
     category = normalize_category(args.category) or (args.category or "").strip()
     row = LeadRow({
         Col.ROW_ID: "PREVIEW", Col.COMPANY: company, Col.CATEGORY: category, Col.TARGET_NAME: (args.name or "").strip(),
         Col.TARGET_EMAIL: "preview@example.com", Col.HOOK: (args.hook or "").strip(),
     })
-    llm = rt.llm()
-    rt.say(f"Writing a sample email for {company or '(no company)'} ({category or 'no category'}) with {llm.provider} ({llm.model}).")
-    rt.say("Nothing is saved or sent, and no Google login is needed.")
+    llm = rt.llm(manual=manual)
+    if manual:
+        rt.say(f"Manual mode: prompts will be copied to your clipboard for {company or '(no company)'} ({category or 'no category'}).")
+        rt.say("Nothing is saved or sent, and no Google login is needed.")
+    else:
+        rt.say(f"Writing a sample email for {company or '(no company)'} ({category or 'no category'}) with {llm.provider} ({llm.model}).")
+        rt.say("Nothing is saved or sent, and no Google login is needed.")
     if args.show_prompt:
         season = season_context(rt.today or date.today())
         rt.say("\n--- exactly what the model is sent ---\nSYSTEM:\n" + build_system_prompt(s.sender, season)
@@ -795,11 +803,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", default="Jane Doe", help="contact name, used only for the greeting and never sent to the model (default %(default)s)")
     p.add_argument("--hook", help="optional Custom Hook / Angle note for the opening")
     p.add_argument("--show-prompt", action="store_true", help="also print exactly what is sent to the model")
+    p.add_argument("--manual", action="store_true", help="copy the prompt to your clipboard; paste Gemini Web's reply back instead of calling the API")
 
     p = sub.add_parser("draft", help="write emails for Pending rows")
     p.add_argument("--limit", type=int, default=DEFAULT_LIMIT, metavar="N", help="most emails to write this run (default %(default)s)")
     p.add_argument("--row", action="append", metavar="ROW_ID", help="draft only this Row ID (repeatable)")
     p.add_argument("--dry-run", action="store_true", help="print the emails without writing them to the sheet")
+    p.add_argument("--manual", action="store_true", help="copy each prompt to your clipboard; paste Gemini Web's reply back instead of calling the API")
 
     p = sub.add_parser("send", help="create Gmail drafts for Approved rows (add --live to really send)")
     p.add_argument("--live", action="store_true", help="actually send. Without this, only Gmail drafts are created")
